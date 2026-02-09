@@ -18,6 +18,11 @@ try:
 except ImportError:
     OPENPYXL_AVAILABLE = False
 
+# Indian tax rates for foreign/unlisted shares (post-Budget 2024)
+LTCG_RATE = 0.125          # 12.5% for holdings >= 24 months
+STCG_RATE = 0.30           # User's marginal slab rate (default 30%)
+LTCG_HOLDING_MONTHS = 24   # Unlisted/foreign shares threshold
+
 def parse_percentage(value_str):
     """Parse percentage string (e.g., '30.9%') to float."""
     if pd.isna(value_str) or str(value_str).strip() == '':
@@ -84,24 +89,26 @@ def get_financial_year(date_obj):
     else:  # January to March
         return f"FY{date_obj.year - 1}-{date_obj.year}"
 
-def get_capital_gains_tax_rate(grant_date, sale_date):
+def get_capital_gains_tax_rate(acquisition_date, sale_date):
     """
     Calculate capital gains tax rate based on holding period.
-    LTCG (Long-Term): 12.5% for holdings > 1 year
-    STCG (Short-Term): 20% for holdings <= 1 year
-    Returns (rate, tax_type)
+    For foreign/unlisted shares (Indian tax rules):
+    LTCG (Long-Term): 12.5% for holdings >= 24 months
+    STCG (Short-Term): 30% (slab rate) for holdings < 24 months
+    Returns (rate, holding_days, tax_type)
     """
-    if grant_date is None or sale_date is None:
+    if acquisition_date is None or sale_date is None:
         return None, None
 
-    holding_period = sale_date - grant_date
-    holding_days = holding_period.days
+    # Exact calendar month calculation for LTCG threshold
+    months_held = (sale_date.year - acquisition_date.year) * 12 + (sale_date.month - acquisition_date.month)
+    if sale_date.day < acquisition_date.day:
+        months_held -= 1
 
-    # More than 365 days (1 year)
-    if holding_days > 365:
-        return 0.125, "LTCG"  # 12.5%
+    if months_held >= LTCG_HOLDING_MONTHS:
+        return LTCG_RATE, "LTCG"
     else:
-        return 0.20, "STCG"   # 20%
+        return STCG_RATE, "STCG"
 
 def _get_sales_history_col_map(writer):
     """
@@ -332,6 +339,7 @@ def process_restricted_stock(df, symbol_for_price='PTC', grant_type='RSU'):
                 'released_qty': float(row['Released Qty']) if pd.notna(row.get('Released Qty')) else 0,
                 'est_market_value': float(row['Est. Market Value']) if pd.notna(row.get('Est. Market Value')) else 0,
                 'events': [],  # List of events (vest, release, sell)
+                'vest_tranches': [],  # Per-vest-tranche data for cost basis
                 'vest_schedules': [],  # List of vest schedules
                 'tax_withholdings': [],  # List of tax withholdings
                 'sales': [],  # List of sales
@@ -363,6 +371,16 @@ def process_restricted_stock(df, symbol_for_price='PTC', grant_type='RSU'):
 
             current_grant['events'].append(event_info)
 
+            # Track vest tranches for RSU cost basis (vest date = acquisition date)
+            if 'vested' in event_type.lower():
+                vest_price = get_stock_price(symbol_for_price, event_date_str) if YFINANCE_AVAILABLE else None
+                current_grant['vest_tranches'].append({
+                    'vest_date': event_date,
+                    'vest_date_str': event_date_str,
+                    'quantity': qty_or_amount,
+                    'vest_price': vest_price
+                })
+
             # Track sales separately
             if 'sold' in event_type.lower():
                 sale_price = float(row['Sale Price']) if pd.notna(row.get('Sale Price')) else None
@@ -376,44 +394,66 @@ def process_restricted_stock(df, symbol_for_price='PTC', grant_type='RSU'):
                 if YFINANCE_AVAILABLE:
                     exchange_rate = get_exchange_rate(event_date_str)
 
+                # Match sale to vest tranche (most recent vest before or on sale date)
+                matched_vest = None
+                for vt in reversed(current_grant['vest_tranches']):
+                    if vt['vest_date'] and event_date and vt['vest_date'] <= event_date:
+                        matched_vest = vt
+                        break
+
+                # Use vest date/price as acquisition date/cost basis for RSUs
+                if matched_vest:
+                    acquisition_date = matched_vest['vest_date']
+                    cost_basis_price = matched_vest['vest_price']
+                else:
+                    # Fallback to grant date if no vest tranche found
+                    acquisition_date = current_grant['grant_date']
+                    cost_basis_price = current_grant['grant_price']
+
                 # Calculate capital gains tax based on holding period
                 capital_gain = 0
                 capital_gains_tax = 0
                 tax_rate = 0
                 tax_type = "N/A"
 
-                if sale_price is not None and current_grant['grant_price'] is not None:
-                    capital_gain = (sale_price - current_grant['grant_price']) * qty_or_amount
+                if sale_price is not None and cost_basis_price is not None:
+                    capital_gain = (sale_price - cost_basis_price) * qty_or_amount
 
-                    # Determine tax rate based on holding period
-                    tax_rate, tax_type = get_capital_gains_tax_rate(current_grant['grant_date'], event_date)
+                    # Determine tax rate based on holding period from vest date
+                    tax_rate, tax_type = get_capital_gains_tax_rate(acquisition_date, event_date)
 
                     if tax_rate is not None:
                         capital_gains_tax = capital_gain * tax_rate
                         current_grant['total_capital_gains_tax'] += capital_gains_tax
 
+                        holding_days = (event_date - acquisition_date).days if acquisition_date else 0
+
                         # Track capital gain tax separately
                         current_grant['capital_gains_tax'].append({
                             'date': event_date,
                             'date_str': event_date_str,
-                            'grant_price': current_grant['grant_price'],
+                            'grant_price': cost_basis_price,
                             'sale_price': sale_price,
                             'quantity': qty_or_amount,
                             'capital_gain': capital_gain,
-                            'holding_days': (event_date - current_grant['grant_date']).days,
+                            'holding_days': holding_days,
                             'tax_type': tax_type,
                             'tax_rate': tax_rate,
                             'tax_amount': capital_gains_tax
                         })
+
+                holding_days = (event_date - acquisition_date).days if acquisition_date and event_date else 0
 
                 sale_info = {
                     'date': event_date,
                     'date_str': event_date_str,
                     'quantity': qty_or_amount,
                     'price': sale_price,
-                    'grant_price': current_grant['grant_price'],
+                    'grant_price': cost_basis_price,  # FMV on vest date
+                    'acquisition_date': acquisition_date,  # Vest date for holding period
                     'capital_gain': capital_gain,
                     'capital_gains_tax': capital_gains_tax,
+                    'holding_days': holding_days,
                     'tax_type': tax_type,
                     'tax_rate': tax_rate,
                     'exchange_rate': exchange_rate
@@ -831,6 +871,7 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
                     'Tax Type': f"Capital Gains ({cg_tax['tax_type']})",
                     'Amount ($)': cg_tax['tax_amount'],
                     'Exchange Rate (USD-INR)': exchange_rate,
+                    'Amount (INR)': None,  # Will be formula
                     '_tax_type_base': cg_tax['tax_type'],  # helper for formula matching (LTCG/STCG)
                     '_is_capital_gains': True
                 }
@@ -841,7 +882,7 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
             year_tax_df = year_tax_df.sort_values(['FY', 'Grant Type'], ascending=[False, True])
 
             # Export visible columns
-            year_tax_df_display = year_tax_df[['FY', 'Grant Type', 'Grant ID', 'Symbol', 'Tax Type', 'Amount ($)', 'Exchange Rate (USD-INR)']]
+            year_tax_df_display = year_tax_df[['FY', 'Grant Type', 'Grant ID', 'Symbol', 'Tax Type', 'Amount ($)', 'Exchange Rate (USD-INR)', 'Amount (INR)']]
             year_tax_df_display.to_excel(writer, sheet_name='Year-wise Tax Summary', index=False)
 
         # Create detailed vesting schedule sheet
@@ -883,7 +924,9 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
                     'Tax Type': sale['tax_type'],
                     'Tax Rate (%)': sale['tax_rate'] * 100 if sale['tax_rate'] else 0,
                     'Capital Gains Tax ($)': sale['capital_gains_tax'],
-                    'Exchange Rate (USD-INR)': sale['exchange_rate']
+                    'Exchange Rate (USD-INR)': sale['exchange_rate'],
+                    'Capital Gain (INR)': None,  # Will be calculated by formula
+                    'Capital Gains Tax (INR)': None  # Will be calculated by formula
                 }
                 sales_data.append(sales_row)
 
@@ -912,6 +955,9 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
                     qty_col = get_column_letter(col_indices.get('Qty. Sold', 1))
                     tax_rate_col = get_column_letter(col_indices.get('Tax Rate (%)', 1))
                     cap_gain_tax_col = get_column_letter(col_indices.get('Capital Gains Tax ($)', 1))
+                    exchange_col = get_column_letter(col_indices.get('Exchange Rate (USD-INR)', 1))
+                    cap_gain_inr_col = get_column_letter(col_indices.get('Capital Gain (INR)', 1))
+                    cap_gain_tax_inr_col = get_column_letter(col_indices.get('Capital Gains Tax (INR)', 1))
 
                     # Capital Gain ($) = (Sale Price - Grant Price) * Quantity
                     worksheet[f'{cap_gain_col}{row_idx}'] = f'=IF(AND(ISNUMBER({sale_price_col}{row_idx}), ISNUMBER({grant_price_col}{row_idx}), ISNUMBER({qty_col}{row_idx})), ({sale_price_col}{row_idx} - {grant_price_col}{row_idx}) * {qty_col}{row_idx}, "")'
@@ -919,9 +965,17 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
                     # Capital Gains Tax ($) = Capital Gain * Tax Rate / 100
                     worksheet[f'{cap_gain_tax_col}{row_idx}'] = f'=IF(AND(ISNUMBER({cap_gain_col}{row_idx}), ISNUMBER({tax_rate_col}{row_idx})), {cap_gain_col}{row_idx} * {tax_rate_col}{row_idx} / 100, "")'
 
+                    # Capital Gain (INR) = Capital Gain ($) * Exchange Rate
+                    worksheet[f'{cap_gain_inr_col}{row_idx}'] = f'=IF(AND(ISNUMBER({cap_gain_col}{row_idx}), ISNUMBER({exchange_col}{row_idx}), {exchange_col}{row_idx}<>0), {cap_gain_col}{row_idx} * {exchange_col}{row_idx}, "")'
+
+                    # Capital Gains Tax (INR) = Capital Gains Tax ($) * Exchange Rate
+                    worksheet[f'{cap_gain_tax_inr_col}{row_idx}'] = f'=IF(AND(ISNUMBER({cap_gain_tax_col}{row_idx}), ISNUMBER({exchange_col}{row_idx}), {exchange_col}{row_idx}<>0), {cap_gain_tax_col}{row_idx} * {exchange_col}{row_idx}, "")'
+
                     # Apply currency formatting
                     for col in [cap_gain_col, sale_price_col, grant_price_col, cap_gain_tax_col]:
                         worksheet[f'{col}{row_idx}'].number_format = '$#,##0.00'
+                    for col in [cap_gain_inr_col, cap_gain_tax_inr_col]:
+                        worksheet[f'{col}{row_idx}'].number_format = '#,##0.00'
                     worksheet[f'{tax_rate_col}{row_idx}'].number_format = '0.00'
 
                 # Auto-adjust column widths
@@ -942,9 +996,22 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
             sales_col_map = _get_sales_history_col_map(writer)
             _build_tax_summary_formulas(writer, year_tax_df, {'fy_col': 'FY'}, sales_col_map)
 
-            # Auto-adjust Year-wise Tax Summary column widths
+            # Add Amount (INR) formulas to Year-wise Tax Summary
             if OPENPYXL_AVAILABLE:
                 worksheet = writer.sheets['Year-wise Tax Summary']
+                ts_col_indices = {cell.value: cell.column for cell in worksheet[1]}
+                amt_usd_idx = ts_col_indices.get('Amount ($)')
+                er_idx = ts_col_indices.get('Exchange Rate (USD-INR)')
+                amt_inr_idx = ts_col_indices.get('Amount (INR)')
+                if amt_usd_idx and er_idx and amt_inr_idx:
+                    amt_usd_letter = get_column_letter(amt_usd_idx)
+                    er_letter = get_column_letter(er_idx)
+                    amt_inr_letter = get_column_letter(amt_inr_idx)
+                    for row_idx in range(2, len(year_tax_data) + 2):
+                        worksheet[f'{amt_inr_letter}{row_idx}'] = f'=IF(AND(ISNUMBER({amt_usd_letter}{row_idx}), ISNUMBER({er_letter}{row_idx}), {er_letter}{row_idx}<>0), {amt_usd_letter}{row_idx} * {er_letter}{row_idx}, "")'
+                        worksheet[f'{amt_inr_letter}{row_idx}'].number_format = '#,##0.00'
+
+                # Auto-adjust Year-wise Tax Summary column widths
                 for column in worksheet.columns:
                     max_length = 0
                     column_letter = column[0].column_letter
@@ -985,11 +1052,11 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
     # Check for validation issues
     issues_df = summary_df[summary_df['Validation Status'] != 'OK']
     if not issues_df.empty:
-        print(f"\n⚠️  Validation issues found in {len(issues_df)} grants:")
+        print(f"\n[WARNING]  Validation issues found in {len(issues_df)} grants:")
         for idx, row in issues_df.iterrows():
             print(f"  - {row['Grant ID']}: {row['Validation Status']}")
     else:
-        print("\n✅ All grants passed validation checks!")
+        print("\n[OK] All grants passed validation checks!")
 
     return summary_df
 
@@ -1080,6 +1147,7 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                 'released_qty': float(row['Released Qty']) if pd.notna(row.get('Released Qty')) else 0,
                 'est_market_value': float(row['Est. Market Value']) if pd.notna(row.get('Est. Market Value')) else 0,
                 'events': [],  # List of events (vest, release, sell)
+                'vest_tranches': [],  # Per-vest-tranche data for cost basis
                 'vest_schedules': [],  # List of vest schedules
                 'tax_withholdings': [],  # List of tax withholdings
                 'sales': [],  # List of sales
@@ -1111,6 +1179,16 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
 
             current_grant['events'].append(event_info)
 
+            # Track vest tranches for RSU cost basis (vest date = acquisition date)
+            if 'vested' in event_type.lower():
+                vest_price = get_stock_price(symbol_for_price, event_date_str) if YFINANCE_AVAILABLE else None
+                current_grant['vest_tranches'].append({
+                    'vest_date': event_date,
+                    'vest_date_str': event_date_str,
+                    'quantity': qty_or_amount,
+                    'vest_price': vest_price
+                })
+
             # Track sales separately
             if 'sold' in event_type.lower():
                 sale_price = float(row['Sale Price']) if pd.notna(row.get('Sale Price')) else None
@@ -1124,44 +1202,66 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                 if YFINANCE_AVAILABLE:
                     exchange_rate = get_exchange_rate(event_date_str)
 
+                # Match sale to vest tranche (most recent vest before or on sale date)
+                matched_vest = None
+                for vt in reversed(current_grant['vest_tranches']):
+                    if vt['vest_date'] and event_date and vt['vest_date'] <= event_date:
+                        matched_vest = vt
+                        break
+
+                # Use vest date/price as acquisition date/cost basis for RSUs
+                if matched_vest:
+                    acquisition_date = matched_vest['vest_date']
+                    cost_basis_price = matched_vest['vest_price']
+                else:
+                    # Fallback to grant date if no vest tranche found
+                    acquisition_date = current_grant['grant_date']
+                    cost_basis_price = current_grant['grant_price']
+
                 # Calculate capital gains tax based on holding period
                 capital_gain = 0
                 capital_gains_tax = 0
                 tax_rate = 0
                 tax_type = "N/A"
 
-                if sale_price is not None and current_grant['grant_price'] is not None:
-                    capital_gain = (sale_price - current_grant['grant_price']) * qty_or_amount
+                if sale_price is not None and cost_basis_price is not None:
+                    capital_gain = (sale_price - cost_basis_price) * qty_or_amount
 
-                    # Determine tax rate based on holding period
-                    tax_rate, tax_type = get_capital_gains_tax_rate(current_grant['grant_date'], event_date)
+                    # Determine tax rate based on holding period from vest date
+                    tax_rate, tax_type = get_capital_gains_tax_rate(acquisition_date, event_date)
 
                     if tax_rate is not None:
                         capital_gains_tax = capital_gain * tax_rate
                         current_grant['total_capital_gains_tax'] += capital_gains_tax
 
+                        holding_days = (event_date - acquisition_date).days if acquisition_date else 0
+
                         # Track capital gain tax separately
                         current_grant['capital_gains_tax'].append({
                             'date': event_date,
                             'date_str': event_date_str,
-                            'grant_price': current_grant['grant_price'],
+                            'grant_price': cost_basis_price,
                             'sale_price': sale_price,
                             'quantity': qty_or_amount,
                             'capital_gain': capital_gain,
-                            'holding_days': (event_date - current_grant['grant_date']).days,
+                            'holding_days': holding_days,
                             'tax_type': tax_type,
                             'tax_rate': tax_rate,
                             'tax_amount': capital_gains_tax
                         })
+
+                holding_days = (event_date - acquisition_date).days if acquisition_date and event_date else 0
 
                 sale_info = {
                     'date': event_date,
                     'date_str': event_date_str,
                     'quantity': qty_or_amount,
                     'price': sale_price,
-                    'grant_price': current_grant['grant_price'],
+                    'grant_price': cost_basis_price,  # FMV on vest date
+                    'acquisition_date': acquisition_date,  # Vest date for holding period
                     'capital_gain': capital_gain,
                     'capital_gains_tax': capital_gains_tax,
+                    'holding_days': holding_days,
                     'tax_type': tax_type,
                     'tax_rate': tax_rate,
                     'exchange_rate': exchange_rate
@@ -1357,6 +1457,7 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                         'Rate (%)': tax['tax_rate'],
                         'Amount ($)': tax['withholding_amount'],
                         'Exchange Rate (USD-INR)': exchange_rate,
+                        'Amount (INR)': None,  # Will be formula
                         '_tax_type_base': None,
                         '_is_capital_gains': False
                     }
@@ -1381,10 +1482,11 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                         'Grant ID': grant['grant_id'],
                         'Symbol': grant['symbol'],
                         'Tax Type': f'{cg_tax["tax_type"]} (Holding: {holding_days_display})',
-                        'Tax Description': f"Sale @ ${cg_tax['sale_price']:.2f} (Grant: ${cg_tax['grant_price']:.2f})",
+                        'Tax Description': f"Sale @ ${cg_tax['sale_price']:.2f} (Cost Basis: ${cg_tax['grant_price']:.2f})",
                         'Rate (%)': cg_tax['tax_rate'] * 100,
                         'Amount ($)': cg_tax['tax_amount'],
                         'Exchange Rate (USD-INR)': exchange_rate,
+                        'Amount (INR)': None,  # Will be formula
                         '_tax_type_base': cg_tax['tax_type'],
                         '_is_capital_gains': True
                     }
@@ -1424,8 +1526,8 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
         sales_data = []
         for grant_id, grant in grants.items():
             for sale in grant['sales']:
-                # Calculate holding period for display
-                holding_days = (sale['date'] - grant['grant_date']).days if sale['date'] and grant['grant_date'] else 0
+                # Use holding_days from sale (based on vest date for RSUs)
+                holding_days = sale.get('holding_days', (sale['date'] - grant['grant_date']).days if sale['date'] and grant['grant_date'] else 0)
                 holding_display = f"{holding_days} days"
                 if holding_days > 365:
                     years = holding_days // 365
@@ -1453,7 +1555,9 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                     'Capital Gains Tax ($)': None,  # Will be calculated by formula
                     'Estimated Proceeds ($)': None,  # Will be calculated by formula
                     'Exchange Rate (USD-INR)': exchange_rate_display,
-                    'Estimated Proceeds (INR)': None  # Will be replaced with formula
+                    'Estimated Proceeds (INR)': None,  # Will be replaced with formula
+                    'Capital Gain (INR)': None,  # Will be calculated by formula
+                    'Capital Gains Tax (INR)': None  # Will be calculated by formula
                 }
                 sales_data.append(sales_row)
 
@@ -1492,6 +1596,8 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                     proceeds_col = get_column_letter(col_indices.get('Estimated Proceeds ($)', 1))
                     exchange_col = get_column_letter(col_indices.get('Exchange Rate (USD-INR)', 1))
                     proceeds_inr_col = get_column_letter(col_indices.get('Estimated Proceeds (INR)', 1))
+                    cap_gain_inr_col = get_column_letter(col_indices.get('Capital Gain (INR)', 1))
+                    cap_gain_tax_inr_col = get_column_letter(col_indices.get('Capital Gains Tax (INR)', 1))
 
                     # Capital Gain ($) = (Sale Price - Grant Price) * Quantity
                     worksheet[f'{cap_gain_col}{row_idx}'] = f'=IF(AND(ISNUMBER({sale_price_col}{row_idx}), ISNUMBER({grant_price_col}{row_idx}), ISNUMBER({qty_col}{row_idx})), ({sale_price_col}{row_idx} - {grant_price_col}{row_idx}) * {qty_col}{row_idx}, "")'
@@ -1505,9 +1611,17 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                     # Estimated Proceeds (INR) = Estimated Proceeds ($) * Exchange Rate
                     worksheet[f'{proceeds_inr_col}{row_idx}'] = f'=IF(AND(ISNUMBER({proceeds_col}{row_idx}), ISNUMBER({exchange_col}{row_idx}), {exchange_col}{row_idx} <> 0), {proceeds_col}{row_idx} * {exchange_col}{row_idx}, "")'
 
+                    # Capital Gain (INR) = Capital Gain ($) * Exchange Rate
+                    worksheet[f'{cap_gain_inr_col}{row_idx}'] = f'=IF(AND(ISNUMBER({cap_gain_col}{row_idx}), ISNUMBER({exchange_col}{row_idx}), {exchange_col}{row_idx}<>0), {cap_gain_col}{row_idx} * {exchange_col}{row_idx}, "")'
+
+                    # Capital Gains Tax (INR) = Capital Gains Tax ($) * Exchange Rate
+                    worksheet[f'{cap_gain_tax_inr_col}{row_idx}'] = f'=IF(AND(ISNUMBER({cap_gain_tax_col}{row_idx}), ISNUMBER({exchange_col}{row_idx}), {exchange_col}{row_idx}<>0), {cap_gain_tax_col}{row_idx} * {exchange_col}{row_idx}, "")'
+
                     # Apply currency formatting
                     for col in [cap_gain_col, sale_price_col, grant_price_col, cap_gain_tax_col, proceeds_col, proceeds_inr_col]:
                         worksheet[f'{col}{row_idx}'].number_format = '$#,##0.00'
+                    for col in [cap_gain_inr_col, cap_gain_tax_inr_col]:
+                        worksheet[f'{col}{row_idx}'].number_format = '#,##0.00'
                     worksheet[f'{tax_rate_col}{row_idx}'].number_format = '0.00'
 
                 # Auto-adjust column widths
@@ -1528,9 +1642,22 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
             sales_col_map = _get_sales_history_col_map(writer)
             _build_tax_summary_formulas(writer, year_tax_df, {'fy_col': 'Financial Year'}, sales_col_map)
 
-            # Auto-adjust Year-wise Tax Summary column widths
+            # Add Amount (INR) formulas to Year-wise Tax Summary
             if OPENPYXL_AVAILABLE:
                 worksheet = writer.sheets['Year-wise Tax Summary']
+                ts_col_indices = {cell.value: cell.column for cell in worksheet[1]}
+                amt_usd_idx = ts_col_indices.get('Amount ($)')
+                er_idx = ts_col_indices.get('Exchange Rate (USD-INR)')
+                amt_inr_idx = ts_col_indices.get('Amount (INR)')
+                if amt_usd_idx and er_idx and amt_inr_idx:
+                    amt_usd_letter = get_column_letter(amt_usd_idx)
+                    er_letter = get_column_letter(er_idx)
+                    amt_inr_letter = get_column_letter(amt_inr_idx)
+                    for row_idx in range(2, len(year_tax_data) + 2):
+                        worksheet[f'{amt_inr_letter}{row_idx}'] = f'=IF(AND(ISNUMBER({amt_usd_letter}{row_idx}), ISNUMBER({er_letter}{row_idx}), {er_letter}{row_idx}<>0), {amt_usd_letter}{row_idx} * {er_letter}{row_idx}, "")'
+                        worksheet[f'{amt_inr_letter}{row_idx}'].number_format = '#,##0.00'
+
+                # Auto-adjust Year-wise Tax Summary column widths
                 for column in worksheet.columns:
                     max_length = 0
                     column_letter = column[0].column_letter
@@ -1576,11 +1703,11 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
     # Check for validation issues
     issues_df = summary_df[summary_df['Validation Status'] != 'OK']
     if not issues_df.empty:
-        print(f"\n⚠️  Validation issues found in {len(issues_df)} grants:")
+        print(f"\n[WARNING]  Validation issues found in {len(issues_df)} grants:")
         for idx, row in issues_df.iterrows():
             print(f"  - {row['Grant ID']}: {row['Validation Status']}")
     else:
-        print("\n✅ All grants passed validation checks!")
+        print("\n[OK] All grants passed validation checks!")
 
     return summary_df
 
