@@ -1,7 +1,4 @@
-.venv/
-*.xlsx
-*.csv
-*.json
-*.log
-__pycache__/
+venv/
 *.pyc
+__pycache__/
+*.xlsx
