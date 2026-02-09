@@ -1,0 +1,7 @@
+{
+  "enabledMcpjsonServers": [
+    "memcord",
+    "memcord-advanced"
+  ],
+  "enableAllProjectMcpServers": true
+}

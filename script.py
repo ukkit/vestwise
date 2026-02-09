@@ -103,6 +103,95 @@ def get_capital_gains_tax_rate(grant_date, sale_date):
     else:
         return 0.20, "STCG"   # 20%
 
+def _get_sales_history_col_map(writer):
+    """
+    Read the header row of the already-written 'Sales History' sheet and return
+    a mapping of column header names to Excel column letters.
+    Returns {} if the sheet doesn't exist or openpyxl is unavailable.
+    """
+    if not OPENPYXL_AVAILABLE:
+        return {}
+    try:
+        ws = writer.sheets['Sales History']
+    except KeyError:
+        return {}
+    col_map = {}
+    for cell in ws[1]:
+        if cell.value is not None:
+            col_map[cell.value] = get_column_letter(cell.column)
+    return col_map
+
+def _build_tax_summary_formulas(writer, year_tax_df, col_config, sales_col_map):
+    """
+    Overlay SUMIFS formulas onto the Amount ($) column of the Year-wise Tax Summary
+    sheet for capital-gains rows.
+
+    Parameters
+    ----------
+    writer : pd.ExcelWriter
+    year_tax_df : DataFrame  (full df including helper columns)
+    col_config : dict
+        - 'fy_col': header name for the FY column in year_tax_df (e.g. 'FY' or 'Financial Year')
+    sales_col_map : dict  {header_name: column_letter} from _get_sales_history_col_map
+    """
+    if not OPENPYXL_AVAILABLE or not sales_col_map:
+        return
+    try:
+        ws = writer.sheets['Year-wise Tax Summary']
+    except KeyError:
+        return
+
+    # Determine Amount ($) column index in the Tax Summary sheet
+    ts_col_indices = {cell.value: cell.column for cell in ws[1]}
+    amount_col_idx = ts_col_indices.get('Amount ($)')
+    if amount_col_idx is None:
+        return
+    amount_col_letter = get_column_letter(amount_col_idx)
+
+    # Look up Sales History column letters dynamically
+    cg_tax_col = sales_col_map.get('Capital Gains Tax ($)')
+    grant_id_col = sales_col_map.get('Grant ID')
+    symbol_col = sales_col_map.get('Symbol')
+    tax_type_col = sales_col_map.get('Tax Type')
+    sale_date_col = sales_col_map.get('Sale Date')
+
+    if not all([cg_tax_col, grant_id_col, symbol_col, tax_type_col, sale_date_col]):
+        return  # Missing required columns — keep static values
+
+    fy_header = col_config.get('fy_col', 'FY')
+
+    for row_idx, (df_idx, row) in enumerate(year_tax_df.iterrows(), start=2):
+        # Skip non-capital-gains rows (withholding tax)
+        if not row.get('_is_capital_gains', True):
+            continue
+
+        grant_id = str(row['Grant ID']).replace('"', '""')
+        symbol = str(row['Symbol']).replace('"', '""')
+        fy = row[fy_header]
+
+        # Extract the tax type base (LTCG or STCG)
+        tax_type_base = row.get('_tax_type_base', None)
+        if not tax_type_base:
+            continue
+
+        # Derive fiscal year start (YYYY) from FY string like 'FY2025-2026'
+        try:
+            fy_start_year = int(str(fy)[2:6])
+        except Exception:
+            continue
+
+        formula = (
+            f"=SUMIFS('Sales History'!${cg_tax_col}:${cg_tax_col},"
+            f"'Sales History'!${grant_id_col}:${grant_id_col},\"{grant_id}\","
+            f"'Sales History'!${symbol_col}:${symbol_col},\"{symbol}\","
+            f"'Sales History'!${tax_type_col}:${tax_type_col},\"{tax_type_base}\","
+            f"'Sales History'!${sale_date_col}:${sale_date_col},\">=\"&DATE({fy_start_year},4,1),"
+            f"'Sales History'!${sale_date_col}:${sale_date_col},\"<=\"&DATE({fy_start_year + 1},3,31))"
+        )
+
+        ws[f'{amount_col_letter}{row_idx}'] = formula
+        ws[f'{amount_col_letter}{row_idx}'].number_format = '$#,##0.00'
+
 def get_exchange_rate(date_str):
     """Get historical USD to INR exchange rate for a given date."""
     if not YFINANCE_AVAILABLE:
@@ -124,7 +213,9 @@ def get_exchange_rate(date_str):
         hist = ticker.history(start=start_date, end=end_date)
 
         if len(hist) > 0:
-            # Use closest date
+            # Normalize tz-aware index to naive for comparison
+            if hist.index.tz is not None:
+                hist.index = hist.index.tz_localize(None)
             closest_date = hist.index[hist.index.get_indexer([parsed_date], method='nearest')[0]]
             return hist.loc[closest_date, 'Close']
     except Exception as e:
@@ -152,14 +243,19 @@ def get_stock_price(symbol, date_str):
 
         hist = ticker.history(start=start_date, end=end_date)
 
-        # Find the closest trading date to the actual date
-        if parsed_date.strftime('%Y-%m-%d') in hist.index.strftime('%Y-%m-%d'):
-            # Exact date match
-            return hist.loc[parsed_date.strftime('%Y-%m-%d'), 'Close']
-        elif len(hist) > 0:
-            # Use closest date
-            closest_date = hist.index[hist.index.get_indexer([parsed_date], method='nearest')[0]]
-            return hist.loc[closest_date, 'Close']
+        if len(hist) > 0:
+            # Normalize tz-aware index to naive for comparison
+            if hist.index.tz is not None:
+                hist.index = hist.index.tz_localize(None)
+            # Find the closest trading date to the actual date
+            if parsed_date.strftime('%Y-%m-%d') in hist.index.strftime('%Y-%m-%d'):
+                # Exact date match
+                idx = hist.index[hist.index.strftime('%Y-%m-%d') == parsed_date.strftime('%Y-%m-%d')][0]
+                return hist.loc[idx, 'Close']
+            else:
+                # Use closest date
+                closest_date = hist.index[hist.index.get_indexer([parsed_date], method='nearest')[0]]
+                return hist.loc[closest_date, 'Close']
     except Exception as e:
         print(f"Could not fetch price for {symbol} on {date_str}: {str(e)}")
         return None
@@ -411,7 +507,7 @@ def process_espp(df, symbol_for_price='PTC'):
         record_type = str(row['Record Type']).strip() if pd.notna(row.get('Record Type')) else ''
 
         # Handle Grant records (for ESPP, this is a Purchase)
-        if record_type == 'Grant':
+        if record_type in ('Grant', 'Purchase'):
             grant_counter += 1
             symbol = str(row['Symbol']).strip() if pd.notna(row.get('Symbol')) else ''
             purchase_date_str = str(row['Purchase Date']).strip() if pd.notna(row.get('Purchase Date')) else ''
@@ -625,10 +721,14 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
                             if schedule['is_future'] and schedule['vest_date']]
         next_vest_date = min(future_vest_dates) if future_vest_dates else None
 
-        # Calculate sellable quantity (alternative calculation)
-        calculated_sellable = (grant['granted_qty'] - grant['vested_qty'] -
-                              grant['withheld_qty'] - grant['total_sold_qty'] +
-                              total_released)
+        # Calculate sellable quantity
+        # RSU: shares are withheld for tax at vesting, so Released = Vested - tax shares
+        # ESPP: all purchased shares are immediately sellable, no release step
+        grant_type = grant.get('grant_type', 'RSU')
+        if grant_type == 'ESPP':
+            calculated_sellable = grant['vested_qty'] - grant['total_sold_qty']
+        else:
+            calculated_sellable = total_released - grant['total_sold_qty']
 
         # Calculate unvested quantity (alternative calculation)
         calculated_unvested = grant['granted_qty'] - grant['vested_qty']
@@ -659,7 +759,7 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
 
         # Prepare summary row with Grant Type
         summary_row = {
-            'Grant Type': grant.get('grant_type', 'RSU'),  # RSU or ESPP
+            'Grant Type': grant_type,
             'Grant ID': grant['grant_id'],
             'Symbol': grant['symbol'],
             'Grant Date': grant['grant_date_str'],
@@ -671,9 +771,7 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
             'Sold': grant['total_sold_qty'],
             'Sale Dates': sale_dates_str,
             'Sellable': grant['sellable_qty'],
-            'Calc Sellable': calculated_sellable,
             'Unvested': grant['unvested_qty'],
-            'Calc Unvested': calculated_unvested,
             'Future Vesting (from schedules)': future_vesting_qty,
             'Next Vest Date': next_vest_str,
             'Estimated Market Value ($)': grant['est_market_value'],
@@ -715,52 +813,36 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
         # Create year-wise tax summary sheet
         year_tax_data = []
 
-        # Add withholding taxes
-        for grant_id, grant in grants.items():
-            for tax in grant['tax_withholdings']:
-                fy = get_financial_year(tax['date']) if tax['date'] else get_financial_year(grant['grant_date'])
-                tax_row = {
-                    'FY': fy,
-                    'Grant Type': grant.get('grant_type', 'RSU'),
-                    'Grant ID': grant['grant_id'],
-                    'Symbol': grant['symbol'],
-                    'Tax Type': 'Withholding',
-                    'Amount ($)': tax['withholding_amount']
-                }
-                year_tax_data.append(tax_row)
-
-        # Add capital gains taxes from sales
+        # Add capital gains taxes from sales (kept as rows so we can build formulas)
         for grant_id, grant in grants.items():
             for cg_tax in grant['capital_gains_tax']:
                 fy = get_financial_year(cg_tax['date']) if cg_tax['date'] else get_financial_year(grant['grant_date'])
+                # Get exchange rate from the matching sale
+                exchange_rate = None
+                for sale in grant['sales']:
+                    if sale['date_str'] == cg_tax['date_str']:
+                        exchange_rate = sale['exchange_rate']
+                        break
                 tax_row = {
                     'FY': fy,
                     'Grant Type': grant.get('grant_type', 'RSU'),
                     'Grant ID': grant['grant_id'],
                     'Symbol': grant['symbol'],
                     'Tax Type': f"Capital Gains ({cg_tax['tax_type']})",
-                    'Amount ($)': cg_tax['tax_amount']
+                    'Amount ($)': cg_tax['tax_amount'],
+                    'Exchange Rate (USD-INR)': exchange_rate,
+                    '_tax_type_base': cg_tax['tax_type'],  # helper for formula matching (LTCG/STCG)
+                    '_is_capital_gains': True
                 }
                 year_tax_data.append(tax_row)
 
         if year_tax_data:
             year_tax_df = pd.DataFrame(year_tax_data)
             year_tax_df = year_tax_df.sort_values(['FY', 'Grant Type'], ascending=[False, True])
-            year_tax_df.to_excel(writer, sheet_name='Year-wise Tax Summary', index=False)
 
-            if OPENPYXL_AVAILABLE:
-                worksheet = writer.sheets['Year-wise Tax Summary']
-                for column in worksheet.columns:
-                    max_length = 0
-                    column_letter = column[0].column_letter
-                    for cell in column:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    adjusted_width = min(max_length + 2, 50)
-                    worksheet.column_dimensions[column_letter].width = adjusted_width
+            # Export visible columns
+            year_tax_df_display = year_tax_df[['FY', 'Grant Type', 'Grant ID', 'Symbol', 'Tax Type', 'Amount ($)', 'Exchange Rate (USD-INR)']]
+            year_tax_df_display.to_excel(writer, sheet_name='Year-wise Tax Summary', index=False)
 
         # Create detailed vesting schedule sheet
         vesting_data = []
@@ -792,7 +874,7 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
                     'Grant ID': grant['grant_id'],
                     'Symbol': grant['symbol'],
                     'Grant Date': grant['grant_date_str'],
-                    'Sale Date': sale['date_str'],
+                    'Sale Date': sale['date'],  # datetime for SUMIFS date comparisons
                     'Qty. Sold': sale['quantity'],
                     'Sale Price ($)': sale['price'],
                     'Grant Price ($)': sale['grant_price'],
@@ -807,24 +889,29 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
 
         if sales_data:
             sales_df = pd.DataFrame(sales_data)
+            # Sort by Sale Date (latest first) — Sale Date is already datetime
+            sales_df = sales_df.sort_values('Sale Date', ascending=False)
+
             sales_df.to_excel(writer, sheet_name='Sales History', index=False)
 
             if OPENPYXL_AVAILABLE:
                 worksheet = writer.sheets['Sales History']
+
+                # Format Sale Date column as date
+                col_indices = {col: idx for idx, col in enumerate(sales_df.columns, 1)}
+                sale_date_col_idx = col_indices.get('Sale Date', None)
+                if sale_date_col_idx:
+                    for row_idx in range(2, len(sales_data) + 2):
+                        worksheet.cell(row=row_idx, column=sale_date_col_idx).number_format = 'YYYY-MM-DD'
+
                 # Add formulas for calculated columns
                 for row_idx, (idx, row) in enumerate(sales_df.iterrows(), start=2):
-                    # Get column indices dynamically
-                    col_indices = {col: idx for idx, col in enumerate(sales_df.columns, 1)}
-
                     cap_gain_col = get_column_letter(col_indices.get('Capital Gain ($)', 1))
                     sale_price_col = get_column_letter(col_indices.get('Sale Price ($)', 1))
                     grant_price_col = get_column_letter(col_indices.get('Grant Price ($)', 1))
                     qty_col = get_column_letter(col_indices.get('Qty. Sold', 1))
                     tax_rate_col = get_column_letter(col_indices.get('Tax Rate (%)', 1))
                     cap_gain_tax_col = get_column_letter(col_indices.get('Capital Gains Tax ($)', 1))
-                    proceeds_col = get_column_letter(col_indices.get('Estimated Proceeds ($)', 1))
-                    exchange_col = get_column_letter(col_indices.get('Exchange Rate (USD-INR)', 1))
-                    proceeds_inr_col = get_column_letter(col_indices.get('Estimated Proceeds (INR)', 1))
 
                     # Capital Gain ($) = (Sale Price - Grant Price) * Quantity
                     worksheet[f'{cap_gain_col}{row_idx}'] = f'=IF(AND(ISNUMBER({sale_price_col}{row_idx}), ISNUMBER({grant_price_col}{row_idx}), ISNUMBER({qty_col}{row_idx})), ({sale_price_col}{row_idx} - {grant_price_col}{row_idx}) * {qty_col}{row_idx}, "")'
@@ -838,6 +925,26 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
                     worksheet[f'{tax_rate_col}{row_idx}'].number_format = '0.00'
 
                 # Auto-adjust column widths
+                for column in worksheet.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 50)
+                    worksheet.column_dimensions[column_letter].width = adjusted_width
+
+        # Inject SUMIFS formulas into Year-wise Tax Summary (after Sales History is written)
+        if year_tax_data:
+            sales_col_map = _get_sales_history_col_map(writer)
+            _build_tax_summary_formulas(writer, year_tax_df, {'fy_col': 'FY'}, sales_col_map)
+
+            # Auto-adjust Year-wise Tax Summary column widths
+            if OPENPYXL_AVAILABLE:
+                worksheet = writer.sheets['Year-wise Tax Summary']
                 for column in worksheet.columns:
                     max_length = 0
                     column_letter = column[0].column_letter
@@ -1137,10 +1244,9 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                             if schedule['is_future'] and schedule['vest_date']]
         next_vest_date = min(future_vest_dates) if future_vest_dates else None
 
-        # Calculate sellable quantity (alternative calculation)
-        calculated_sellable = (grant['granted_qty'] - grant['vested_qty'] -
-                              grant['withheld_qty'] - grant['total_sold_qty'] +
-                              total_released)
+        # Calculate sellable quantity
+        # RSU: Released already accounts for ~30% tax withholding at vesting
+        calculated_sellable = total_released - grant['total_sold_qty']
 
         # Calculate unvested quantity (alternative calculation)
         calculated_unvested = grant['granted_qty'] - grant['vested_qty']
@@ -1250,7 +1356,9 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                         'Tax Description': tax['tax_description'],
                         'Rate (%)': tax['tax_rate'],
                         'Amount ($)': tax['withholding_amount'],
-                        'Exchange Rate (USD-INR)': exchange_rate
+                        'Exchange Rate (USD-INR)': exchange_rate,
+                        '_tax_type_base': None,
+                        '_is_capital_gains': False
                     }
                     year_tax_data.append(year_tax_row)
 
@@ -1276,7 +1384,9 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                         'Tax Description': f"Sale @ ${cg_tax['sale_price']:.2f} (Grant: ${cg_tax['grant_price']:.2f})",
                         'Rate (%)': cg_tax['tax_rate'] * 100,
                         'Amount ($)': cg_tax['tax_amount'],
-                        'Exchange Rate (USD-INR)': exchange_rate
+                        'Exchange Rate (USD-INR)': exchange_rate,
+                        '_tax_type_base': cg_tax['tax_type'],
+                        '_is_capital_gains': True
                     }
                     year_tax_data.append(year_tax_row)
 
@@ -1285,22 +1395,10 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
             # Sort by Financial Year (descending), then by tax amount
             year_tax_df = year_tax_df.sort_values(['Financial Year', 'Amount ($)'],
                                                   ascending=[False, False])
-            year_tax_df.to_excel(writer, sheet_name='Year-wise Tax Summary', index=False)
 
-            # Auto-adjust column widths
-            if OPENPYXL_AVAILABLE:
-                worksheet = writer.sheets['Year-wise Tax Summary']
-                for column in worksheet.columns:
-                    max_length = 0
-                    column_letter = column[0].column_letter
-                    for cell in column:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    adjusted_width = min(max_length + 2, 50)
-                    worksheet.column_dimensions[column_letter].width = adjusted_width
+            # Filter out helper columns before writing to Excel
+            year_tax_df_display = year_tax_df.drop(columns=['_tax_type_base', '_is_capital_gains'])
+            year_tax_df_display.to_excel(writer, sheet_name='Year-wise Tax Summary', index=False)
 
         # Create detailed vesting schedule sheet
         vesting_data = []
@@ -1344,7 +1442,7 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                     'Grant ID': grant['grant_id'],
                     'Symbol': grant['symbol'],
                     'Grant Date': grant['grant_date_str'],
-                    'Sale Date': sale['date_str'],
+                    'Sale Date': sale['date'],  # datetime for SUMIFS date comparisons
                     'Holding Period': holding_display,
                     'Quantity Sold': sale['quantity'],
                     'Grant Price ($)': sale['grant_price'],
@@ -1361,10 +1459,8 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
 
         if sales_data:
             sales_df = pd.DataFrame(sales_data)
-            # Sort by Sale Date (earliest first)
-            sales_df['Sale Date Parsed'] = pd.to_datetime(sales_df['Sale Date'], errors='coerce')
-            sales_df = sales_df.sort_values('Sale Date Parsed', ascending=True)
-            sales_df = sales_df.drop('Sale Date Parsed', axis=1)
+            # Sort by Sale Date (latest first) — Sale Date is already datetime
+            sales_df = sales_df.sort_values('Sale Date', ascending=False)
 
             sales_df.to_excel(writer, sheet_name='Sales History', index=False)
 
@@ -1377,6 +1473,12 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                 col_indices = {}
                 for col_idx, col_cell in enumerate(worksheet[1], 1):
                     col_indices[col_cell.value] = col_idx
+
+                # Format Sale Date column as date
+                sale_date_col_idx = col_indices.get('Sale Date', None)
+                if sale_date_col_idx:
+                    for row_idx in range(2, len(sales_data) + 2):
+                        worksheet.cell(row=row_idx, column=sale_date_col_idx).number_format = 'YYYY-MM-DD'
 
                 # Add formulas for calculated columns (starting from row 2)
                 for row_idx in range(2, len(sales_data) + 2):
@@ -1409,6 +1511,26 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                     worksheet[f'{tax_rate_col}{row_idx}'].number_format = '0.00'
 
                 # Auto-adjust column widths
+                for column in worksheet.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 50)
+                    worksheet.column_dimensions[column_letter].width = adjusted_width
+
+        # Inject SUMIFS formulas into Year-wise Tax Summary (after Sales History is written)
+        if year_tax_data:
+            sales_col_map = _get_sales_history_col_map(writer)
+            _build_tax_summary_formulas(writer, year_tax_df, {'fy_col': 'Financial Year'}, sales_col_map)
+
+            # Auto-adjust Year-wise Tax Summary column widths
+            if OPENPYXL_AVAILABLE:
+                worksheet = writer.sheets['Year-wise Tax Summary']
                 for column in worksheet.columns:
                     max_length = 0
                     column_letter = column[0].column_letter
@@ -1465,7 +1587,9 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
 def main():
     # File paths
     input_file = "BenefitHistory.xlsx"  # Input file with multiple sheets (ESPP and Restricted Stock)
-    output_file = "rsu_summary.xlsx"  # Output file name
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # output_file = "rsu_summary.xlsx"  # Output file name
+    output_file = f"{timestamp}_rsu_summary.xlsx"
 
     # Process the benefit history (RSU and ESPP)
     summary_df = process_rsu_tracker(input_file, output_file)
