@@ -1,6 +1,9 @@
+import os
+import calendar
+import urllib.request
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, date as date_cls
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -22,6 +25,10 @@ except ImportError:
 LTCG_RATE = 0.125          # 12.5% for holdings >= 24 months
 STCG_RATE = 0.30           # User's marginal slab rate (default 30%)
 LTCG_HOLDING_MONTHS = 24   # Unlisted/foreign shares threshold
+
+# SBI TTBR (Telegraphic Transfer Buying Rate) for Rule 115 compliant USD-INR conversion
+SBI_TTBR_CSV_URL = "https://raw.githubusercontent.com/sahilgupta/sbi-fx-ratekeeper/main/csv_files/SBI_REFERENCE_RATES_USD.csv"
+SBI_TTBR_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "SBI_REFERENCE_RATES_USD.csv")
 
 def parse_percentage(value_str):
     """Parse percentage string (e.g., '30.9%') to float."""
@@ -199,34 +206,145 @@ def _build_tax_summary_formulas(writer, year_tax_df, col_config, sales_col_map):
         ws[f'{amount_col_letter}{row_idx}'] = formula
         ws[f'{amount_col_letter}{row_idx}'].number_format = '$#,##0.00'
 
+_sbi_ttbr_df = None  # Module-level cache for SBI TTBR data
+
+def _load_sbi_ttbr_data():
+    """
+    Load SBI TTBR data from cached CSV or download from GitHub.
+    Returns a DataFrame indexed by date with 'TT BUY' values, or None on failure.
+    """
+    global _sbi_ttbr_df
+    if _sbi_ttbr_df is not None:
+        return _sbi_ttbr_df if not _sbi_ttbr_df.empty else None
+
+    cache_file = SBI_TTBR_CACHE_FILE
+    need_download = True
+
+    # Check if cached file exists and is fresh (< 7 days old)
+    if os.path.exists(cache_file):
+        age_days = (datetime.now().timestamp() - os.path.getmtime(cache_file)) / 86400
+        if age_days < 7:
+            need_download = False
+
+    if need_download:
+        try:
+            os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+            print(f"Downloading SBI TTBR rates from GitHub...")
+            with urllib.request.urlopen(SBI_TTBR_CSV_URL, timeout=15) as response:
+                with open(cache_file, 'wb') as f:
+                    f.write(response.read())
+            print(f"[OK] SBI TTBR rates cached to {cache_file}")
+        except Exception as e:
+            print(f"[WARNING] Failed to download SBI TTBR data: {e}")
+            if not os.path.exists(cache_file):
+                _sbi_ttbr_df = pd.DataFrame()  # sentinel to avoid retrying
+                return None
+            # Use stale cache if download fails
+
+    try:
+        df = pd.read_csv(cache_file)
+        required_cols = {'DATE', 'TT BUY'}
+        missing = required_cols - set(df.columns.str.strip())
+        if missing:
+            print(f"[WARNING] SBI TTBR CSV missing expected columns: {missing}")
+            _sbi_ttbr_df = pd.DataFrame()
+            return None
+        df.columns = df.columns.str.strip()
+        df['DATE'] = pd.to_datetime(df['DATE'], format='mixed')
+        df['TT BUY'] = pd.to_numeric(df['TT BUY'], errors='coerce')
+        # Filter out holidays (TT BUY = 0) and NaN
+        df = df[df['TT BUY'].notna() & (df['TT BUY'] > 0)]
+        df['date_only'] = df['DATE'].dt.date
+        df = df.set_index('date_only').sort_index()
+        _sbi_ttbr_df = df
+        return df
+    except Exception as e:
+        print(f"[WARNING] Failed to parse SBI TTBR CSV: {e}")
+        _sbi_ttbr_df = pd.DataFrame()  # sentinel to avoid retrying
+        return None
+
+
+def get_sbi_ttbr(transaction_date_str):
+    """
+    Get SBI TTBR rate per Rule 115: last business day of the month preceding
+    the transaction month.
+
+    Parameters
+    ----------
+    transaction_date_str : str
+        Date string of the transaction
+
+    Returns
+    -------
+    float or None
+        The TT BUY rate, or None if unavailable
+    """
+    df = _load_sbi_ttbr_data()
+    if df is None:
+        return None
+
+    parsed = parse_date(transaction_date_str)
+    if parsed is None:
+        return None
+
+    # Compute the preceding month
+    if parsed.month == 1:
+        prev_year = parsed.year - 1
+        prev_month = 12
+    else:
+        prev_year = parsed.year
+        prev_month = parsed.month - 1
+
+    # Filter to rows in the preceding month
+    last_day = calendar.monthrange(prev_year, prev_month)[1]
+    month_start = date_cls(prev_year, prev_month, 1)
+    month_end = date_cls(prev_year, prev_month, last_day)
+
+    mask = (df.index >= month_start) & (df.index <= month_end)
+    month_data = df.loc[mask]
+
+    if month_data.empty:
+        return None
+
+    # Last available date in that month with non-zero TT BUY
+    last_row = month_data.iloc[-1]
+    return float(last_row['TT BUY'])
+
+
 def get_exchange_rate(date_str):
-    """Get historical USD to INR exchange rate for a given date."""
+    """
+    Get historical USD to INR exchange rate for a given date.
+    Uses SBI TTBR (Rule 115 compliant) first, falls back to yfinance market rate.
+    """
+    # Try SBI TTBR first (Rule 115 compliant)
+    sbi_rate = get_sbi_ttbr(date_str)
+    if sbi_rate is not None:
+        return sbi_rate
+
+    # Fallback to yfinance market rate
+    print(f"[WARNING] SBI TTBR not available for {date_str}, using yfinance market rate")
+
     if not YFINANCE_AVAILABLE:
         return None
 
     try:
-        # Parse the date
         parsed_date = parse_date(date_str)
         if parsed_date is None:
             return None
 
-        # Get USDINR exchange rate from yfinance
         ticker = yf.Ticker('USDINR=X')
-
-        # Get historical data around the date
         start_date = (parsed_date - pd.Timedelta(days=5)).strftime('%Y-%m-%d')
         end_date = (parsed_date + pd.Timedelta(days=5)).strftime('%Y-%m-%d')
 
         hist = ticker.history(start=start_date, end=end_date)
 
         if len(hist) > 0:
-            # Normalize tz-aware index to naive for comparison
             if hist.index.tz is not None:
                 hist.index = hist.index.tz_localize(None)
             closest_date = hist.index[hist.index.get_indexer([parsed_date], method='nearest')[0]]
             return hist.loc[closest_date, 'Close']
     except Exception as e:
-        pass  # Silently fail and return None
+        print(f"[WARNING] yfinance exchange rate lookup failed for {date_str}: {e}")
 
     return None
 
