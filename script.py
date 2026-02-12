@@ -17,6 +17,7 @@ except ImportError:
 
 try:
     from openpyxl.utils import get_column_letter
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     OPENPYXL_AVAILABLE = True
 except ImportError:
     OPENPYXL_AVAILABLE = False
@@ -135,7 +136,7 @@ def _get_sales_history_col_map(writer):
             col_map[cell.value] = get_column_letter(cell.column)
     return col_map
 
-def _build_tax_summary_formulas(writer, year_tax_df, col_config, sales_col_map):
+def _build_tax_summary_formulas(writer, year_tax_df, col_config, sales_col_map, data_row_mapping=None):
     """
     Overlay SUMIFS formulas onto the Amount ($) column of the Year-wise Tax Summary
     sheet for capital-gains rows.
@@ -147,6 +148,9 @@ def _build_tax_summary_formulas(writer, year_tax_df, col_config, sales_col_map):
     col_config : dict
         - 'fy_col': header name for the FY column in year_tax_df (e.g. 'FY' or 'Financial Year')
     sales_col_map : dict  {header_name: column_letter} from _get_sales_history_col_map
+    data_row_mapping : list of (excel_row, df_row_series), optional
+        Explicit mapping of Excel row numbers to DataFrame rows.
+        If None, assumes consecutive rows starting at row 2.
     """
     if not OPENPYXL_AVAILABLE or not sales_col_map:
         return
@@ -174,7 +178,13 @@ def _build_tax_summary_formulas(writer, year_tax_df, col_config, sales_col_map):
 
     fy_header = col_config.get('fy_col', 'FY')
 
-    for row_idx, (df_idx, row) in enumerate(year_tax_df.iterrows(), start=2):
+    # Build iteration source
+    if data_row_mapping is not None:
+        row_iter = data_row_mapping  # list of (excel_row, row_series)
+    else:
+        row_iter = [(row_idx, row) for row_idx, (_, row) in enumerate(year_tax_df.iterrows(), start=2)]
+
+    for row_idx, row in row_iter:
         # Skip non-capital-gains rows (withholding tax)
         if not row.get('_is_capital_gains', True):
             continue
@@ -205,6 +215,217 @@ def _build_tax_summary_formulas(writer, year_tax_df, col_config, sales_col_map):
 
         ws[f'{amount_col_letter}{row_idx}'] = formula
         ws[f'{amount_col_letter}{row_idx}'].number_format = '$#,##0.00'
+
+
+def _write_tax_summary_with_subtotals(writer, year_tax_df, fy_col, display_cols):
+    """
+    Write Year-wise Tax Summary sheet with FY subtotal rows.
+
+    Returns
+    -------
+    data_row_mapping : list of (excel_row, row_series)
+        Maps each data row's Excel row number to its DataFrame row.
+    subtotal_rows : set of int
+        Excel row numbers that are subtotal rows (for skip_rows in _format_worksheet).
+    """
+    from openpyxl.utils import get_column_letter as _gcl
+
+    wb = writer.book
+    ws = wb.create_sheet('Year-wise Tax Summary')
+    writer.sheets['Year-wise Tax Summary'] = ws
+
+    # Write header
+    for col_idx, col_name in enumerate(display_cols, 1):
+        ws.cell(row=1, column=col_idx, value=col_name)
+
+    # Build column index lookup
+    col_lookup = {name: idx for idx, name in enumerate(display_cols, 1)}
+    amt_usd_col_idx = col_lookup.get('Amount ($)')
+    amt_inr_col_idx = col_lookup.get('Amount (INR)')
+    fy_col_idx = col_lookup.get(fy_col)
+
+    # Group by FY (preserving sort order)
+    grouped = year_tax_df.groupby(fy_col, sort=False)
+
+    excel_row = 2
+    data_row_mapping = []
+    subtotal_rows = set()
+
+    for fy_val, group_df in grouped:
+        group_start_row = excel_row
+        for _, row in group_df.iterrows():
+            for col_idx, col_name in enumerate(display_cols, 1):
+                val = row.get(col_name)
+                if pd.notna(val) if not isinstance(val, str) else val:
+                    ws.cell(row=excel_row, column=col_idx, value=val)
+            data_row_mapping.append((excel_row, row))
+            excel_row += 1
+        group_end_row = excel_row - 1
+
+        # --- Subtotal row ---
+        subtotal_row = excel_row
+        subtotal_rows.add(subtotal_row)
+
+        if fy_col_idx:
+            ws.cell(row=subtotal_row, column=fy_col_idx, value=f'{fy_val} Total')
+
+        if amt_usd_col_idx:
+            col_letter = _gcl(amt_usd_col_idx)
+            ws.cell(row=subtotal_row, column=amt_usd_col_idx,
+                    value=f'=SUM({col_letter}{group_start_row}:{col_letter}{group_end_row})')
+            ws.cell(row=subtotal_row, column=amt_usd_col_idx).number_format = '$#,##0.00'
+
+        if amt_inr_col_idx:
+            col_letter = _gcl(amt_inr_col_idx)
+            ws.cell(row=subtotal_row, column=amt_inr_col_idx,
+                    value=f'=SUM({col_letter}{group_start_row}:{col_letter}{group_end_row})')
+            ws.cell(row=subtotal_row, column=amt_inr_col_idx).number_format = '#,##0.00'
+
+        # Style the subtotal row
+        for col_idx in range(1, len(display_cols) + 1):
+            cell = ws.cell(row=subtotal_row, column=col_idx)
+            cell.font = _SUBTOTAL_FONT
+            cell.fill = _SUBTOTAL_FILL
+            cell.border = _THIN_BORDER
+
+        excel_row += 1
+
+    return data_row_mapping, subtotal_rows
+
+
+# Column header patterns for center-alignment
+_CENTER_ALIGN_HEADERS = {
+    'Symbol', 'Tax Type', 'FY', 'Financial Year', 'Grant Type', 'Is Future',
+    'Is Future Vesting', 'Validation Status', '# of Sales',
+    '# of Vest Schedules', '# of Tax Withholdings', 'Vest Period',
+    'Holding Days', 'Days to Vesting', 'Qty. Sold', 'Quantity Sold',
+    'Vested Qty.', 'Vested Quantity', 'Released Qty', 'Released Quantity',
+    'Units', 'Vested to Date', 'Withheld for Taxes', 'Released to Account',
+    'Sold', 'Sellable', 'Calc Sellable', 'Unvested', 'Calc Unvested',
+    'Future Vesting (from schedules)', 'Future Vesting Qty', 'Grant ID',
+    'Holding Period', 'Rate (%)',
+}
+
+# Styles (defined once, reused across all sheets)
+_HEADER_FONT = Font(name='Calibri', size=10, bold=True, color='FFFFFF')
+_HEADER_FILL = PatternFill(start_color='2F5496', end_color='2F5496', fill_type='solid')
+_HEADER_ALIGNMENT = Alignment(horizontal='center', vertical='center', wrap_text=True)
+_DATA_FONT = Font(name='Calibri', size=10)
+_ALT_ROW_FILL = PatternFill(start_color='F2F6FA', end_color='F2F6FA', fill_type='solid')
+_THIN_BORDER = Border(
+    left=Side(style='thin', color='D0D0D0'),
+    right=Side(style='thin', color='D0D0D0'),
+    top=Side(style='thin', color='D0D0D0'),
+    bottom=Side(style='thin', color='D0D0D0'),
+)
+_SUBTOTAL_FILL = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid')
+_SUBTOTAL_FONT = Font(name='Calibri', size=10, bold=True)
+_OK_FILL = PatternFill(start_color='E2EFDA', end_color='E2EFDA', fill_type='solid')
+_OK_FONT = Font(name='Calibri', size=10, color='375623')
+_ISSUE_FONT = Font(name='Calibri', size=10, color='C00000', bold=True)
+
+
+def _format_worksheet(ws, skip_rows=None):
+    """
+    Apply professional formatting to a worksheet.
+
+    Parameters
+    ----------
+    ws : openpyxl Worksheet
+    skip_rows : set[int], optional
+        Row numbers (1-based) to skip (e.g. subtotal rows that have their own styling).
+    """
+    if not OPENPYXL_AVAILABLE:
+        return
+
+    skip_rows = skip_rows or set()
+
+    # Freeze header row
+    ws.freeze_panes = 'A2'
+
+    # Build header name -> column letter mapping
+    header_names = {}
+    for cell in ws[1]:
+        if cell.value is not None:
+            header_names[cell.column] = str(cell.value)
+
+    max_col = ws.max_column
+    max_row = ws.max_row
+
+    # --- Header row styling ---
+    for col_idx in range(1, max_col + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+        cell.alignment = _HEADER_ALIGNMENT
+        cell.border = _THIN_BORDER
+
+    # --- Data row styling ---
+    for row_idx in range(2, max_row + 1):
+        if row_idx in skip_rows:
+            continue
+        is_even = (row_idx % 2 == 0)
+        for col_idx in range(1, max_col + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.font = _DATA_FONT
+            cell.border = _THIN_BORDER
+            if is_even:
+                cell.fill = _ALT_ROW_FILL
+
+            # Alignment based on header name
+            hdr = header_names.get(col_idx, '')
+            if hdr in _CENTER_ALIGN_HEADERS:
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+            elif hdr.endswith(('($)', '(INR)', '(%)', '(USD-INR)')):
+                cell.alignment = Alignment(horizontal='right', vertical='center')
+
+    # --- Validation Status conditional coloring ---
+    vs_col = None
+    for col_idx, hdr in header_names.items():
+        if hdr == 'Validation Status':
+            vs_col = col_idx
+            break
+    if vs_col:
+        for row_idx in range(2, max_row + 1):
+            cell = ws.cell(row=row_idx, column=vs_col)
+            val = str(cell.value).strip() if cell.value else ''
+            if val == 'OK':
+                cell.fill = _OK_FILL
+                cell.font = _OK_FONT
+            elif val and val != 'None':
+                cell.font = _ISSUE_FONT
+
+    # --- Auto-fit column widths ---
+    for col_idx in range(1, max_col + 1):
+        max_length = 0
+        col_letter = get_column_letter(col_idx)
+        for row_idx in range(1, max_row + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            try:
+                cell_len = len(str(cell.value))
+                if cell_len > max_length:
+                    max_length = cell_len
+            except:
+                pass
+        adjusted_width = min(max_length + 3, 50)
+        ws.column_dimensions[col_letter].width = adjusted_width
+
+    # --- Currency / number formats on data rows ---
+    for col_idx, hdr in header_names.items():
+        if '($)' in hdr or hdr == 'Estimated Market Value ($)':
+            fmt = '$#,##0.00'
+        elif '(INR)' in hdr:
+            fmt = '#,##0.00'
+        elif hdr in ('Tax Rate (%)', 'Rate (%)'):
+            fmt = '0.00'
+        elif hdr == 'Withholding Amount ($)' or hdr == 'Tax Withheld ($)':
+            fmt = '$#,##0.00'
+        else:
+            continue
+        for row_idx in range(2, max_row + 1):
+            if row_idx not in skip_rows:
+                ws.cell(row=row_idx, column=col_idx).number_format = fmt
+
 
 _sbi_ttbr_df = None  # Module-level cache for SBI TTBR data
 
@@ -954,22 +1175,10 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
         # Main summary sheet
         summary_df.to_excel(writer, sheet_name='Grant Summary', index=False)
 
-        # Auto-adjust column widths
-        worksheet = writer.sheets['Grant Summary']
-        for column in worksheet.columns:
-            max_length = 0
-            column_letter = column[0].column_letter
-            for cell in column:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            adjusted_width = min(max_length + 2, 50)
-            worksheet.column_dimensions[column_letter].width = adjusted_width
-
         # Create year-wise tax summary sheet
         year_tax_data = []
+        tax_summary_subtotal_rows = set()
+        tax_summary_data_row_mapping = []
 
         # Add capital gains taxes from sales (kept as rows so we can build formulas)
         for grant_id, grant in grants.items():
@@ -999,9 +1208,11 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
             year_tax_df = pd.DataFrame(year_tax_data)
             year_tax_df = year_tax_df.sort_values(['FY', 'Grant Type'], ascending=[False, True])
 
-            # Export visible columns
-            year_tax_df_display = year_tax_df[['FY', 'Grant Type', 'Grant ID', 'Symbol', 'Tax Type', 'Amount ($)', 'Exchange Rate (USD-INR)', 'Amount (INR)']]
-            year_tax_df_display.to_excel(writer, sheet_name='Year-wise Tax Summary', index=False)
+            # Write with FY subtotal rows
+            display_cols = ['FY', 'Grant Type', 'Grant ID', 'Symbol', 'Tax Type', 'Amount ($)', 'Exchange Rate (USD-INR)', 'Amount (INR)']
+            tax_summary_data_row_mapping, tax_summary_subtotal_rows = _write_tax_summary_with_subtotals(
+                writer, year_tax_df, 'FY', display_cols
+            )
 
         # Create detailed vesting schedule sheet
         vesting_data = []
@@ -1049,19 +1260,6 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
                     for row_idx in range(2, len(vesting_data) + 2):
                         ws_vest[f'{days_letter}{row_idx}'] = f'=IF({vest_date_letter}{row_idx}>TODAY(), {vest_date_letter}{row_idx}-TODAY(), "")'
                         ws_vest[f'{days_letter}{row_idx}'].number_format = '0'
-
-                # Auto-adjust column widths
-                for column in ws_vest.columns:
-                    max_length = 0
-                    column_letter = column[0].column_letter
-                    for cell in column:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    adjusted_width = min(max_length + 2, 50)
-                    ws_vest.column_dimensions[column_letter].width = adjusted_width
 
         # Create sales history sheet
         sales_data = []
@@ -1135,28 +1333,16 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
                         worksheet[f'{col}{row_idx}'].number_format = '#,##0.00'
                     worksheet[f'{tax_rate_col}{row_idx}'].number_format = '0.00'
 
-                # Auto-adjust column widths
-                for column in worksheet.columns:
-                    max_length = 0
-                    column_letter = column[0].column_letter
-                    for cell in column:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    adjusted_width = min(max_length + 2, 50)
-                    worksheet.column_dimensions[column_letter].width = adjusted_width
-
         # Inject SUMIFS formulas into Year-wise Tax Summary (after Sales History is written)
         if year_tax_data:
             sales_col_map = _get_sales_history_col_map(writer)
-            _build_tax_summary_formulas(writer, year_tax_df, {'fy_col': 'FY'}, sales_col_map)
+            _build_tax_summary_formulas(writer, year_tax_df, {'fy_col': 'FY'}, sales_col_map,
+                                        data_row_mapping=tax_summary_data_row_mapping)
 
-            # Add Amount (INR) formulas to Year-wise Tax Summary
+            # Add Amount (INR) formulas to Year-wise Tax Summary (data rows only)
             if OPENPYXL_AVAILABLE:
-                worksheet = writer.sheets['Year-wise Tax Summary']
-                ts_col_indices = {cell.value: cell.column for cell in worksheet[1]}
+                ws_tax = writer.sheets['Year-wise Tax Summary']
+                ts_col_indices = {cell.value: cell.column for cell in ws_tax[1]}
                 amt_usd_idx = ts_col_indices.get('Amount ($)')
                 er_idx = ts_col_indices.get('Exchange Rate (USD-INR)')
                 amt_inr_idx = ts_col_indices.get('Amount (INR)')
@@ -1164,22 +1350,9 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
                     amt_usd_letter = get_column_letter(amt_usd_idx)
                     er_letter = get_column_letter(er_idx)
                     amt_inr_letter = get_column_letter(amt_inr_idx)
-                    for row_idx in range(2, len(year_tax_data) + 2):
-                        worksheet[f'{amt_inr_letter}{row_idx}'] = f'=IF(AND(ISNUMBER({amt_usd_letter}{row_idx}), ISNUMBER({er_letter}{row_idx}), {er_letter}{row_idx}<>0), {amt_usd_letter}{row_idx} * {er_letter}{row_idx}, "")'
-                        worksheet[f'{amt_inr_letter}{row_idx}'].number_format = '#,##0.00'
-
-                # Auto-adjust Year-wise Tax Summary column widths
-                for column in worksheet.columns:
-                    max_length = 0
-                    column_letter = column[0].column_letter
-                    for cell in column:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    adjusted_width = min(max_length + 2, 50)
-                    worksheet.column_dimensions[column_letter].width = adjusted_width
+                    for row_idx, _ in tax_summary_data_row_mapping:
+                        ws_tax[f'{amt_inr_letter}{row_idx}'] = f'=IF(AND(ISNUMBER({amt_usd_letter}{row_idx}), ISNUMBER({er_letter}{row_idx}), {er_letter}{row_idx}<>0), {amt_usd_letter}{row_idx} * {er_letter}{row_idx}, "")'
+                        ws_tax[f'{amt_inr_letter}{row_idx}'].number_format = '#,##0.00'
 
         # Create tax withholding sheet
         tax_data = []
@@ -1203,6 +1376,18 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
             tax_df = tax_df.sort_values('Grant Date Parsed', ascending=False)
             tax_df = tax_df.drop('Grant Date Parsed', axis=1)
             tax_df.to_excel(writer, sheet_name='Tax Withholdings', index=False)
+
+        # --- Apply formatting to all sheets ---
+        if OPENPYXL_AVAILABLE:
+            _format_worksheet(writer.sheets['Grant Summary'])
+            if year_tax_data:
+                _format_worksheet(writer.sheets['Year-wise Tax Summary'], skip_rows=tax_summary_subtotal_rows)
+            if vesting_data:
+                _format_worksheet(writer.sheets['Vesting Schedule'])
+            if sales_data:
+                _format_worksheet(writer.sheets['Sales History'])
+            if tax_data:
+                _format_worksheet(writer.sheets['Tax Withholdings'])
 
     print(f"Summary created successfully: {output_file}")
 
@@ -1579,22 +1764,10 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
         # Main summary sheet
         summary_df.to_excel(writer, sheet_name='Grant Summary', index=False)
 
-        # Auto-adjust column widths
-        worksheet = writer.sheets['Grant Summary']
-        for column in worksheet.columns:
-            max_length = 0
-            column_letter = column[0].column_letter
-            for cell in column:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            adjusted_width = min(max_length + 2, 50)
-            worksheet.column_dimensions[column_letter].width = adjusted_width
-
         # Create year-wise tax summary sheet
         year_tax_data = []
+        tax_summary_subtotal_rows = set()
+        tax_summary_data_row_mapping = []
 
         # Add withholding taxes
         for grant_id, grant in grants.items():
@@ -1655,9 +1828,11 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
             year_tax_df = year_tax_df.sort_values(['Financial Year', 'Amount ($)'],
                                                   ascending=[False, False])
 
-            # Filter out helper columns before writing to Excel
-            year_tax_df_display = year_tax_df.drop(columns=['_tax_type_base', '_is_capital_gains'])
-            year_tax_df_display.to_excel(writer, sheet_name='Year-wise Tax Summary', index=False)
+            # Write with FY subtotal rows
+            display_cols = ['Financial Year', 'Tax Date', 'Grant ID', 'Symbol', 'Tax Type', 'Tax Description', 'Rate (%)', 'Amount ($)', 'Exchange Rate (USD-INR)', 'Amount (INR)']
+            tax_summary_data_row_mapping, tax_summary_subtotal_rows = _write_tax_summary_with_subtotals(
+                writer, year_tax_df, 'Financial Year', display_cols
+            )
 
         # Create detailed vesting schedule sheet
         vesting_data = []
@@ -1704,19 +1879,6 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                     for row_idx in range(2, len(vesting_data) + 2):
                         ws_vest[f'{days_letter}{row_idx}'] = f'=IF({vest_date_letter}{row_idx}>TODAY(), {vest_date_letter}{row_idx}-TODAY(), "")'
                         ws_vest[f'{days_letter}{row_idx}'].number_format = '0'
-
-                # Auto-adjust column widths
-                for column in ws_vest.columns:
-                    max_length = 0
-                    column_letter = column[0].column_letter
-                    for cell in column:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    adjusted_width = min(max_length + 2, 50)
-                    ws_vest.column_dimensions[column_letter].width = adjusted_width
 
         # Create sales history sheet
         sales_data = []
@@ -1766,7 +1928,6 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
 
             # Add formulas and formatting for calculated columns
             if OPENPYXL_AVAILABLE:
-                from openpyxl.styles import numbers
                 worksheet = writer.sheets['Sales History']
 
                 # Find the column indices
@@ -1820,28 +1981,16 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                         worksheet[f'{col}{row_idx}'].number_format = '#,##0.00'
                     worksheet[f'{tax_rate_col}{row_idx}'].number_format = '0.00'
 
-                # Auto-adjust column widths
-                for column in worksheet.columns:
-                    max_length = 0
-                    column_letter = column[0].column_letter
-                    for cell in column:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    adjusted_width = min(max_length + 2, 50)
-                    worksheet.column_dimensions[column_letter].width = adjusted_width
-
         # Inject SUMIFS formulas into Year-wise Tax Summary (after Sales History is written)
         if year_tax_data:
             sales_col_map = _get_sales_history_col_map(writer)
-            _build_tax_summary_formulas(writer, year_tax_df, {'fy_col': 'Financial Year'}, sales_col_map)
+            _build_tax_summary_formulas(writer, year_tax_df, {'fy_col': 'Financial Year'}, sales_col_map,
+                                        data_row_mapping=tax_summary_data_row_mapping)
 
-            # Add Amount (INR) formulas to Year-wise Tax Summary
+            # Add Amount (INR) formulas to Year-wise Tax Summary (data rows only)
             if OPENPYXL_AVAILABLE:
-                worksheet = writer.sheets['Year-wise Tax Summary']
-                ts_col_indices = {cell.value: cell.column for cell in worksheet[1]}
+                ws_tax = writer.sheets['Year-wise Tax Summary']
+                ts_col_indices = {cell.value: cell.column for cell in ws_tax[1]}
                 amt_usd_idx = ts_col_indices.get('Amount ($)')
                 er_idx = ts_col_indices.get('Exchange Rate (USD-INR)')
                 amt_inr_idx = ts_col_indices.get('Amount (INR)')
@@ -1849,22 +1998,9 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
                     amt_usd_letter = get_column_letter(amt_usd_idx)
                     er_letter = get_column_letter(er_idx)
                     amt_inr_letter = get_column_letter(amt_inr_idx)
-                    for row_idx in range(2, len(year_tax_data) + 2):
-                        worksheet[f'{amt_inr_letter}{row_idx}'] = f'=IF(AND(ISNUMBER({amt_usd_letter}{row_idx}), ISNUMBER({er_letter}{row_idx}), {er_letter}{row_idx}<>0), {amt_usd_letter}{row_idx} * {er_letter}{row_idx}, "")'
-                        worksheet[f'{amt_inr_letter}{row_idx}'].number_format = '#,##0.00'
-
-                # Auto-adjust Year-wise Tax Summary column widths
-                for column in worksheet.columns:
-                    max_length = 0
-                    column_letter = column[0].column_letter
-                    for cell in column:
-                        try:
-                            if len(str(cell.value)) > max_length:
-                                max_length = len(str(cell.value))
-                        except:
-                            pass
-                    adjusted_width = min(max_length + 2, 50)
-                    worksheet.column_dimensions[column_letter].width = adjusted_width
+                    for row_idx, _ in tax_summary_data_row_mapping:
+                        ws_tax[f'{amt_inr_letter}{row_idx}'] = f'=IF(AND(ISNUMBER({amt_usd_letter}{row_idx}), ISNUMBER({er_letter}{row_idx}), {er_letter}{row_idx}<>0), {amt_usd_letter}{row_idx} * {er_letter}{row_idx}, "")'
+                        ws_tax[f'{amt_inr_letter}{row_idx}'].number_format = '#,##0.00'
 
         # Create tax withholding sheet
         tax_data = []
@@ -1888,13 +2024,19 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
             tax_df = tax_df.drop('Grant Date Parsed', axis=1)
             tax_df.to_excel(writer, sheet_name='Tax Withholdings', index=False)
 
+        # --- Apply formatting to all sheets ---
+        if OPENPYXL_AVAILABLE:
+            _format_worksheet(writer.sheets['Grant Summary'])
+            if year_tax_data:
+                _format_worksheet(writer.sheets['Year-wise Tax Summary'], skip_rows=tax_summary_subtotal_rows)
+            if vesting_data:
+                _format_worksheet(writer.sheets['Vesting Schedule'])
+            if sales_data:
+                _format_worksheet(writer.sheets['Sales History'])
+            if tax_data:
+                _format_worksheet(writer.sheets['Tax Withholdings'])
+
     print(f"Summary created successfully: {output_file}")
-    # print(f"\nSummary Statistics:")
-    # print(f"- Total grants processed: {len(summary_df)}")
-    # print(f"- Total granted quantity: {summary_df['Granted Quantity'].sum():.0f}")
-    # print(f"- Total vested quantity: {summary_df['Total Vested to Date'].sum():.0f}")
-    # print(f"- Total sellable quantity: {summary_df['Currently Sellable Quantity'].sum():.0f}")
-    # print(f"- Total unvested quantity: {summary_df['Currently Locked/Unvested Quantity'].sum():.0f}")
 
     # Check for validation issues
     issues_df = summary_df[summary_df['Validation Status'] != 'OK']
