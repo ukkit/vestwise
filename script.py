@@ -1006,23 +1006,62 @@ def process_benefit_history(input_file, output_file, symbol_for_price='PTC'):
         # Create detailed vesting schedule sheet
         vesting_data = []
         for grant_id, grant in grants.items():
+            # Calculate expected shares per future vest from grant's unvested qty
+            num_future_vests = sum(1 for s in grant['vest_schedules'] if s['is_future'])
+            expected_per_vest = (grant['unvested_qty'] / num_future_vests) if num_future_vests > 0 else 0
+
             for schedule in grant['vest_schedules']:
                 vesting_row = {
                     'Grant Type': grant.get('grant_type', 'RSU'),
                     'Grant ID': grant['grant_id'],
                     'Symbol': grant['symbol'],
                     'Grant Date': grant['grant_date_str'],
-                    'Vest Date': schedule['vest_date_str'],
+                    'Vest Date': schedule['vest_date'],  # datetime for formulas
                     'Vest Period': schedule['vest_period'],
                     'Vested Qty.': schedule['vested_qty'],
                     'Released Qty': schedule['released_qty'],
-                    'Is Future': 'Yes' if schedule['is_future'] else 'No'
+                    'Is Future': 'Yes' if schedule['is_future'] else 'No',
+                    'Days to Vesting': None,  # Formula placeholder
+                    'Future Vesting Qty': expected_per_vest if schedule['is_future'] else None
                 }
                 vesting_data.append(vesting_row)
 
         if vesting_data:
             vesting_df = pd.DataFrame(vesting_data)
+            # Sort by Vest Date descending (future dates first)
+            vesting_df = vesting_df.sort_values('Vest Date', ascending=False)
             vesting_df.to_excel(writer, sheet_name='Vesting Schedule', index=False)
+
+            if OPENPYXL_AVAILABLE:
+                ws_vest = writer.sheets['Vesting Schedule']
+                vest_col_indices = {cell.value: cell.column for cell in ws_vest[1]}
+                vest_date_col_idx = vest_col_indices.get('Vest Date')
+                days_col_idx = vest_col_indices.get('Days to Vesting')
+
+                if vest_date_col_idx:
+                    vest_date_letter = get_column_letter(vest_date_col_idx)
+                    for row_idx in range(2, len(vesting_data) + 2):
+                        ws_vest.cell(row=row_idx, column=vest_date_col_idx).number_format = 'YYYY-MM-DD'
+
+                if days_col_idx and vest_date_col_idx:
+                    days_letter = get_column_letter(days_col_idx)
+                    vest_date_letter = get_column_letter(vest_date_col_idx)
+                    for row_idx in range(2, len(vesting_data) + 2):
+                        ws_vest[f'{days_letter}{row_idx}'] = f'=IF({vest_date_letter}{row_idx}>TODAY(), {vest_date_letter}{row_idx}-TODAY(), "")'
+                        ws_vest[f'{days_letter}{row_idx}'].number_format = '0'
+
+                # Auto-adjust column widths
+                for column in ws_vest.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 50)
+                    ws_vest.column_dimensions[column_letter].width = adjusted_width
 
         # Create sales history sheet
         sales_data = []
@@ -1623,22 +1662,61 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price='PTC'):
         # Create detailed vesting schedule sheet
         vesting_data = []
         for grant_id, grant in grants.items():
+            # Calculate expected shares per future vest from grant's unvested qty
+            num_future_vests = sum(1 for s in grant['vest_schedules'] if s['is_future'])
+            expected_per_vest = (grant['unvested_qty'] / num_future_vests) if num_future_vests > 0 else 0
+
             for schedule in grant['vest_schedules']:
                 vesting_row = {
                     'Grant ID': grant['grant_id'],
                     'Symbol': grant['symbol'],
                     'Grant Date': grant['grant_date_str'],
-                    'Vest Date': schedule['vest_date_str'],
+                    'Vest Date': schedule['vest_date'],  # datetime for formulas
                     'Vest Period': schedule['vest_period'],
                     'Vested Quantity': schedule['vested_qty'],
                     'Released Quantity': schedule['released_qty'],
-                    'Is Future Vesting': 'Yes' if schedule['is_future'] else 'No'
+                    'Is Future Vesting': 'Yes' if schedule['is_future'] else 'No',
+                    'Days to Vesting': None,  # Formula placeholder
+                    'Future Vesting Qty': expected_per_vest if schedule['is_future'] else None
                 }
                 vesting_data.append(vesting_row)
 
         if vesting_data:
             vesting_df = pd.DataFrame(vesting_data)
+            # Sort by Vest Date descending (future dates first)
+            vesting_df = vesting_df.sort_values('Vest Date', ascending=False)
             vesting_df.to_excel(writer, sheet_name='Vesting Schedule', index=False)
+
+            if OPENPYXL_AVAILABLE:
+                ws_vest = writer.sheets['Vesting Schedule']
+                vest_col_indices = {cell.value: cell.column for cell in ws_vest[1]}
+                vest_date_col_idx = vest_col_indices.get('Vest Date')
+                days_col_idx = vest_col_indices.get('Days to Vesting')
+
+                if vest_date_col_idx:
+                    vest_date_letter = get_column_letter(vest_date_col_idx)
+                    for row_idx in range(2, len(vesting_data) + 2):
+                        ws_vest.cell(row=row_idx, column=vest_date_col_idx).number_format = 'YYYY-MM-DD'
+
+                if days_col_idx and vest_date_col_idx:
+                    days_letter = get_column_letter(days_col_idx)
+                    vest_date_letter = get_column_letter(vest_date_col_idx)
+                    for row_idx in range(2, len(vesting_data) + 2):
+                        ws_vest[f'{days_letter}{row_idx}'] = f'=IF({vest_date_letter}{row_idx}>TODAY(), {vest_date_letter}{row_idx}-TODAY(), "")'
+                        ws_vest[f'{days_letter}{row_idx}'].number_format = '0'
+
+                # Auto-adjust column widths
+                for column in ws_vest.columns:
+                    max_length = 0
+                    column_letter = column[0].column_letter
+                    for cell in column:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 50)
+                    ws_vest.column_dimensions[column_letter].width = adjusted_width
 
         # Create sales history sheet
         sales_data = []
