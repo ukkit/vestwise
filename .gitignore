@@ -18,5 +18,6 @@ data/
 # IDE / tooling
 .claude/
 .vscode/
+CLAUDE.md
 *.egg-info/
 dist/
