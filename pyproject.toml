@@ -1,0 +1,49 @@
+[project]
+name = "vestwise"
+version = "2026.0227"
+description = "RSU/ESPP capital gains tracker with Indian tax compliance"
+requires-python = ">=3.11"
+
+dependencies = [
+    "pandas",
+    "openpyxl",
+    "yfinance",
+    "numpy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "mypy",
+    "bandit",
+    "pandas-stubs",
+]
+
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]   # pycodestyle, pyflakes, isort
+ignore = ["E501"]                # line length handled by formatter
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true    # yfinance/openpyxl have incomplete stubs
+warn_unused_ignores = true
+warn_return_any = false
+
+[tool.bandit.config]
+# Run as: uv run bandit -c pyproject.toml *.py
+# (bandit does not auto-detect pyproject.toml, the -c flag is required)
+
+[tool.bandit]
+skips = [
+    "B101",   # assert statements
+    "B110",   # try/except/pass — intentional in date parsing and cell width measurement
+    "B112",   # try/except/continue — intentional in date format iteration and FY parsing
+    "B310",   # urllib.request.urlopen — URL is a hardcoded GitHub constant, not user input
+    "B314",   # xml.etree.ElementTree.fromstring — parses trusted local xlsx files only
+    "B405",   # xml.etree.ElementTree import — same as above
+]

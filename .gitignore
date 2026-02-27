@@ -1,5 +1,22 @@
+# Python
 venv/
+.venv/
 *.pyc
 __pycache__/
+
+# uv
+.python-version
+.mypy_cache/
+.pytest_cache/
+
+# Output files
 *.xlsx
+
+# Data cache and overrides (user-specific, re-generated on run)
 data/
+
+# IDE / tooling
+.claude/
+.vscode/
+*.egg-info/
+dist/
