@@ -1,11 +1,10 @@
 # VestWise
 
-Track RSU and ESPP capital gains for Indian tax filing.
+Turn eTrade RSU/ESPP history into ITR-ready capital gains schedules.
 
 Processes an eTrade `BenefitHistory.xlsx` export and produces a formatted Excel workbook.
 
-**Sample files:** [`sample/BenefitHistory.xlsx`](sample/BenefitHistory.xlsx) (input) · [`sample/20260301_124234_rsu_summary.xlsx`](sample/20260301_124234_rsu_summary.xlsx) (output)
-
+**Sample files:** [`sample/BenefitHistory.xlsx`](sample/BenefitHistory.xlsx) (input) ·
 > [!CAUTION]
 > **For personal reference only.** This tool is not a substitute for professional tax advice. Do not use its output for actual tax filings. Tax laws change, calculations may be incorrect, and individual circumstances vary. Always consult a qualified chartered accountant for your ITR.
 
@@ -33,10 +32,14 @@ Place `BenefitHistory.xlsx` (downloaded from eTrade) in the project directory, t
 uv run script.py
 ```
 
-Writes a timestamped output file, e.g. `20260301_120000_rsu_summary.xlsx`.
+Writes a timestamped output file, e.g. `20260301_120000_rsu_summary.xlsx` in project directory.
 
+## Output
 
-## Output Sheets
+[`sample/20260301_124234_rsu_summary.xlsx`](sample/20260301_124234_rsu_summary.xlsx) (output)
+
+<details>
+<summary><strong>Output Sheets</strong></summary>
 
 | Sheet | What it's for |
 |---|---|
@@ -47,7 +50,10 @@ Writes a timestamped output file, e.g. `20260301_120000_rsu_summary.xlsx`.
 | **Tax Withholdings** | RSU tax-withholding events with INR exchange rates |
 | **Schedule FA (Table A3)** | ITR foreign asset disclosure — one row per calendar year per company (see below) |
 
-## Schedule FA (Table A3)
+</details>
+
+<details>
+<summary><strong>Schedule FA (Table A3)</strong></summary>
 
 Schedule FA is the foreign asset disclosure required in ITR-2/ITR-3. It is based on **Calendar Year** (Jan–Dec), not the Indian Financial Year.
 
@@ -66,6 +72,8 @@ The sheet has one row per CY per company ticker, and contains all the numbers yo
 | **Sale Proceeds ($) / (INR)** | Total sale proceeds in this CY |
 
 > Before filing, replace the ticker symbol in "Name of Entity" with the company's full legal name and registered address.
+
+</details>
 
 ## Indian Tax Rules Applied
 
@@ -97,3 +105,5 @@ Persists actual sale execution prices across runs. Auto-populated on first run u
 **To correct a price:** edit `sale_price_usd` directly, set `source=manual`, optionally add a note. Existing entries are never overwritten by the script — only new sales get appended.
 
 > `[WARNING]` lines for pre-2020 dates are expected — SBI TTBR data is only available from January 2020 onward.
+
+---

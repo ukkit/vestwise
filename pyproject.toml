@@ -1,7 +1,8 @@
 [project]
 name = "vestwise"
-version = "2026.0301.1226"
-description = "RSU/ESPP capital gains tracker with Indian tax compliance"
+version = "2026.0301.2221"
+description = "Turn eTrade RSU/ESPP history into ITR-ready capital gains schedules"
+authors = [{name = "Neeraj Tikku"}]
 requires-python = ">=3.11"
 
 dependencies = [

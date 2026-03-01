@@ -1,4 +1,6 @@
-__version__ = "2026.0301.1226"
+__version__ = "2026.0301.2221"
+__author__ = "Neeraj Tikku"
+__copyright__ = "Copyright 2026, Neeraj Tikku"
 
 import calendar
 import os
