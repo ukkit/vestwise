@@ -1,6 +1,10 @@
 # VestWise
 
-RSU/ESPP capital gains tracker with Indian tax compliance. Processes a Schwab `BenefitHistory.xlsx` export and produces a formatted Excel workbook.
+Track RSU and ESPP capital gains for Indian tax filing.
+
+Processes an eTrade `BenefitHistory.xlsx` export and produces a formatted Excel workbook.
+
+**Sample files:** [`sample/BenefitHistory.xlsx`](sample/BenefitHistory.xlsx) (input) · [`sample/20260301_124234_rsu_summary.xlsx`](sample/20260301_124234_rsu_summary.xlsx) (output)
 
 > [!CAUTION]
 > **For personal reference only.** This tool is not a substitute for professional tax advice. Do not use its output for actual tax filings. Tax laws change, calculations may be incorrect, and individual circumstances vary. Always consult a qualified chartered accountant for your ITR.
@@ -23,13 +27,14 @@ No need to create a virtualenv or run `pip install` — `uv` reads `pyproject.to
 
 ## Usage
 
-Place `BenefitHistory.xlsx` (downloaded from Schwab) in the project directory, then:
+Place `BenefitHistory.xlsx` (downloaded from eTrade) in the project directory, then:
 
 ```bash
 uv run script.py
 ```
 
 Writes a timestamped output file, e.g. `20260301_120000_rsu_summary.xlsx`.
+
 
 ## Output Sheets
 
@@ -91,25 +96,4 @@ Persists actual sale execution prices across runs. Auto-populated on first run u
 
 **To correct a price:** edit `sale_price_usd` directly, set `source=manual`, optionally add a note. Existing entries are never overwritten by the script — only new sales get appended.
 
-## Sample Output
-
-```
-Reading file: BenefitHistory.xlsx
-Found ESPP sheet
-Found Restricted Stock sheet
-[OK] Loaded 5 sale price overrides from data/sale_price_overrides.csv
-
-Processing Restricted Stock sheet...
-[WARNING] SBI TTBR not available for 06/04/2018, using yfinance market rate
-Found 9 Restricted Stock grants
-
-Processing ESPP sheet...
-Found 3 ESPP grants
-[OK] Saved 5 sale price overrides to data/sale_price_overrides.csv
-Found 21 total grants
-Summary created successfully: 20260301_120000_rsu_summary.xlsx
-
-[OK] All grants passed validation checks!
-```
-
-`[WARNING]` lines for pre-2020 dates are expected — SBI TTBR data is only available from January 2020 onward.
+> `[WARNING]` lines for pre-2020 dates are expected — SBI TTBR data is only available from January 2020 onward.

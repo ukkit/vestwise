@@ -11,6 +11,7 @@ __pycache__/
 
 # Output files
 *.xlsx
+!sample/*.xlsx
 
 # Data cache and overrides (user-specific, re-generated on run)
 data/
