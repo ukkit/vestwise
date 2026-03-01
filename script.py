@@ -1,4 +1,4 @@
-__version__ = "2026.0227.2138"
+__version__ = "2026.0301.1226"
 
 import calendar
 import os
@@ -350,6 +350,15 @@ _CENTER_ALIGN_HEADERS = {
     "Grant ID",
     "Holding Period",
     "Rate (%)",
+    # Schedule FA (Table A3) columns
+    "CY",
+    "AY",
+    "Country Code",
+    "Nature of Interest",
+    "Date Since Held",
+    "Vested in CY",
+    "Sold in CY",
+    "Shares Held (Dec 31)",
 }
 
 # Styles (defined once, reused across all sheets)
@@ -1212,6 +1221,274 @@ def process_espp(df, symbol_for_price="PTC", overrides=None):
     return grants
 
 
+def _fifo_date_since_held(vests_sorted, sales_sorted, cutoff):
+    """
+    Returns the vest_date_str of the oldest unsold vest tranche as of `cutoff` (datetime).
+    FIFO: oldest vests are consumed by oldest sales first.
+    Returns None if all shares sold.
+    """
+    vests = [
+        (vt["vest_date"], vt["vest_date_str"], float(vt["quantity"]))
+        for vt in vests_sorted
+        if vt["vest_date"] and vt["vest_date"] <= cutoff
+    ]
+    sold_remaining = sum(float(s["quantity"]) for s in sales_sorted if s["date"] and s["date"] <= cutoff)
+    for _vest_date, vest_date_str, qty in vests:
+        if sold_remaining <= 0:
+            return vest_date_str
+        sold_remaining -= qty
+        if sold_remaining < 0:
+            return vest_date_str  # tranche partially consumed, some shares still held
+    return None  # all shares sold
+
+
+def _write_schedule_fa_table_a3(writer, grants):
+    """
+    Generate Schedule FA Table A3 sheet for ITR filing.
+
+    Table A3: Details of Foreign Equity and Debt Interest held in any entity.
+    One row per (Indian Financial Year, company symbol) covering the full vesting history.
+
+    Indian FY: Apr 1 – Mar 31.  Schedule FA uses Calendar Year (Jan–Dec) for closing balances.
+    For each FY row, the relevant CY is the FY's start year (e.g. FY2024-25 → CY2024 → Dec 31, 2024).
+    """
+    # --- Collect per-symbol vests and sales ---
+    symbol_data: dict = {}
+
+    for _grant_id, grant in grants.items():
+        symbol = grant["symbol"]
+        if not symbol:
+            continue
+
+        if symbol not in symbol_data:
+            symbol_data[symbol] = {"vests": [], "sales": []}
+
+        sd = symbol_data[symbol]
+
+        # Build vest-date → price lookup from vest_tranches (gross vested, but price is valid)
+        vest_tranches = grant.get("vest_tranches", [])
+        vt_price_by_date = {
+            vt["vest_date"].date(): vt["vest_price"]
+            for vt in vest_tranches
+            if vt.get("vest_date") is not None and vt.get("vest_price") is not None
+        }
+
+        # Collect NET shares received using "released" events (RSU) or "PURCHASE" events (ESPP).
+        # This avoids double-counting tax-withheld shares that never entered the account.
+        for event in grant.get("events", []):
+            etype = event.get("type", "").lower()
+            if ("released" in etype or etype == "purchase") and event.get("date") is not None:
+                vest_price = vt_price_by_date.get(event["date"].date())
+                if vest_price is None and etype == "purchase":
+                    vest_price = grant.get("grant_price")
+                sd["vests"].append(
+                    {
+                        "vest_date": event["date"],
+                        "vest_date_str": event["date_str"],
+                        "quantity": float(event["quantity"] or 0),
+                        "vest_price": vest_price,
+                    }
+                )
+
+        for sale in grant["sales"]:
+            if sale.get("date") is not None:
+                sd["sales"].append(
+                    {
+                        "date": sale["date"],
+                        "quantity": float(sale.get("quantity") or 0),
+                        "price": sale.get("price"),
+                        "exchange_rate": sale.get("exchange_rate"),
+                    }
+                )
+
+    if not symbol_data:
+        return
+
+    # Sort vests and sales chronologically
+    for sd in symbol_data.values():
+        sd["vests"].sort(key=lambda v: v["vest_date"])
+        sd["sales"].sort(key=lambda s: s["date"])
+
+    # --- Determine calendar years with any activity ---
+    cy_years: set = set()
+    for sd in symbol_data.values():
+        for vt in sd["vests"]:
+            cy_years.add(vt["vest_date"].year)
+        for s in sd["sales"]:
+            cy_years.add(s["date"].year)
+
+    # Always include the current CY
+    cy_years.add(datetime.now().year)
+
+    # --- Build one row per (CY, symbol) ---
+    fa_rows = []
+
+    for y in sorted(cy_years):
+        cy_start_dt = datetime(y, 1, 1)
+        cy_end_dt = datetime(y, 12, 31)
+        cy_prev_end_dt = datetime(y - 1, 12, 31)
+        dec31_date_str = f"{y}-12-31"
+
+        for symbol, sd in symbol_data.items():
+            all_vests = sd["vests"]
+            all_sales = sd["sales"]
+
+            # Quantities vested / sold within the CY window
+            vested_in_cy = sum(vt["quantity"] for vt in all_vests if cy_start_dt <= vt["vest_date"] <= cy_end_dt)
+            sold_in_cy = sum(s["quantity"] for s in all_sales if cy_start_dt <= s["date"] <= cy_end_dt)
+
+            # Cumulative holdings as of Dec 31
+            cum_vested_dec31 = sum(vt["quantity"] for vt in all_vests if vt["vest_date"] <= cy_end_dt)
+            cum_sold_dec31 = sum(s["quantity"] for s in all_sales if s["date"] <= cy_end_dt)
+            shares_held_dec31 = cum_vested_dec31 - cum_sold_dec31
+
+            # Skip rows with no activity and no holdings
+            if vested_in_cy == 0 and sold_in_cy == 0 and shares_held_dec31 <= 0:
+                continue
+
+            # Acquisition value: releases within this CY
+            acq_value_usd = 0.0
+            acq_value_inr = 0.0
+            has_acq_value = False
+            for vt in all_vests:
+                if cy_start_dt <= vt["vest_date"] <= cy_end_dt and vt["vest_price"] is not None:
+                    exch = get_exchange_rate(vt["vest_date_str"]) or 0.0
+                    acq_value_usd += vt["vest_price"] * vt["quantity"]
+                    acq_value_inr += vt["vest_price"] * vt["quantity"] * exch
+                    has_acq_value = True
+
+            # Sale proceeds: sales within this CY
+            sale_proceeds_usd = 0.0
+            sale_proceeds_inr = 0.0
+            has_sale_proceeds = False
+            for s in all_sales:
+                if cy_start_dt <= s["date"] <= cy_end_dt and s.get("price") is not None:
+                    proceeds = s["price"] * s["quantity"]
+                    sale_proceeds_usd += proceeds
+                    sale_proceeds_inr += proceeds * (s.get("exchange_rate") or 0.0)
+                    has_sale_proceeds = True
+
+            # Dec 31 market data (nearest available trading day)
+            dec31_price = get_stock_price(symbol, dec31_date_str) if YFINANCE_AVAILABLE else None
+            dec31_rate = get_exchange_rate(dec31_date_str) or None
+
+            # Peak price: highest intraday high during the CY
+            peak_price_cy = None
+            if YFINANCE_AVAILABLE:
+                try:
+                    hist = yf.Ticker(symbol).history(start=f"{y}-01-01", end=f"{y + 1}-01-01")
+                    if not hist.empty:
+                        peak_price_cy = float(hist["High"].max())
+                except Exception:
+                    pass
+
+            # Peak shares = shares at Jan 1 + all releases during CY (before any CY sales)
+            cum_vested_prev = sum(vt["quantity"] for vt in all_vests if vt["vest_date"] <= cy_prev_end_dt)
+            cum_sold_prev = sum(s["quantity"] for s in all_sales if s["date"] <= cy_prev_end_dt)
+            peak_shares = (cum_vested_prev - cum_sold_prev) + vested_in_cy
+
+            peak_balance_inr = (
+                peak_shares * peak_price_cy * dec31_rate
+                if peak_price_cy is not None and dec31_rate is not None and peak_shares > 0
+                else None
+            )
+            closing_balance_inr = (
+                shares_held_dec31 * dec31_price * dec31_rate
+                if dec31_price is not None and dec31_rate is not None and shares_held_dec31 > 0
+                else None
+            )
+
+            # Date Since Held: FIFO cutoff = Dec 31 (matches Schedule FA reporting date)
+            date_since_held = _fifo_date_since_held(all_vests, all_sales, cy_end_dt)
+
+            fa_rows.append(
+                {
+                    "CY": f"CY{y}",
+                    "AY": f"AY{y + 1}-{y + 2}",
+                    "Country Code": "US",
+                    "Name of Entity (Ticker)": symbol,
+                    "Nature of Interest": "Direct",
+                    "Date Since Held": date_since_held or "",
+                    "Vested in CY": vested_in_cy if vested_in_cy > 0 else None,
+                    "Sold in CY": sold_in_cy if sold_in_cy > 0 else None,
+                    "Shares Held (Dec 31)": shares_held_dec31 if shares_held_dec31 > 0 else (0 if cum_vested_dec31 > 0 else None),
+                    "Acquisition Value ($)": acq_value_usd if has_acq_value else None,
+                    "Acquisition Value (INR)": acq_value_inr if has_acq_value else None,
+                    "Dec 31 Price ($)": dec31_price,
+                    "Dec 31 Rate (USD-INR)": dec31_rate,
+                    "Peak Balance (INR)": peak_balance_inr,
+                    "Closing Balance (INR)": closing_balance_inr,
+                    "Sale Proceeds ($)": sale_proceeds_usd if has_sale_proceeds else None,
+                    "Sale Proceeds (INR)": sale_proceeds_inr if has_sale_proceeds else None,
+                }
+            )
+
+    # Sort: most recent CY first, then by symbol
+    fa_rows.sort(key=lambda r: (-int(str(r["CY"])[2:]), r["Name of Entity (Ticker)"]))
+
+    if not fa_rows:
+        return
+
+    fa_df = pd.DataFrame(fa_rows)
+    fa_df.to_excel(writer, sheet_name="Schedule FA (Table A3)", index=False)
+
+    if not OPENPYXL_AVAILABLE:
+        return
+
+    ws = writer.sheets["Schedule FA (Table A3)"]
+    _format_worksheet(ws)
+
+    # Explicit number formats not handled by _format_worksheet column-suffix logic
+    col_indices = {cell.value: cell.column for cell in ws[1]}
+    num_data_rows = len(fa_rows)
+
+    for col_name, fmt in [
+        ("Dec 31 Rate (USD-INR)", "0.0000"),
+        ("Vested in CY", "#,##0"),
+        ("Sold in CY", "#,##0"),
+        ("Shares Held (Dec 31)", "#,##0"),
+    ]:
+        col_idx = col_indices.get(col_name)
+        if col_idx:
+            for row_idx in range(2, num_data_rows + 2):
+                ws.cell(row=row_idx, column=col_idx).number_format = fmt
+
+    # Notes section below data
+    note_row = num_data_rows + 3
+    notes = [
+        ("NOTES — Schedule FA Table A3 (ITR-2/ITR-3) | One row per Calendar Year (Jan–Dec) per company", True),
+        ("  CY = Calendar Year (Jan 1 – Dec 31). AY = Assessment Year for ITR filing (CY+1 to CY+2).", False),
+        ("  'Date Since Held' uses FIFO logic — shows the vest date of the oldest UNSOLD tranche as of Dec 31.", False),
+        ("  'Shares Held (Dec 31)' = closing balance to report in Schedule FA.", False),
+        ("  'Peak Balance (INR)' = (shares at Jan 1 + released in CY) × peak CY intraday high × Dec 31 SBI TTBR.", False),
+        ("  'Closing Balance (INR)' = Shares Held (Dec 31) × Dec 31 Price × Dec 31 SBI TTBR.", False),
+        ("  'Acquisition Value' = FMV at release × released qty × SBI TTBR on release date (cost basis of received shares).", False),
+        ("  Replace 'Name of Entity (Ticker)' with the full company name and registered address before filing ITR.", False),
+        ("  File Form 67 BEFORE submitting ITR if claiming foreign tax credit on dividends.", False),
+        ("  Non-disclosure of foreign assets attracts Rs.10 lakh penalty under the Black Money Act.", False),
+    ]
+
+    bold_font = Font(name="Calibri", size=9, bold=True, color="2F5496")
+    note_font = Font(name="Calibri", size=9, italic=True, color="595959")
+    max_col = ws.max_column
+
+    for i, (note_text, is_heading) in enumerate(notes):
+        cell = ws.cell(row=note_row + i, column=1)
+        cell.value = note_text
+        cell.font = bold_font if is_heading else note_font
+        cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        if max_col > 1:
+            ws.merge_cells(
+                start_row=note_row + i,
+                start_column=1,
+                end_row=note_row + i,
+                end_column=max_col,
+            )
+        ws.row_dimensions[note_row + i].height = 18
+
+    ws.row_dimensions[note_row].height = 20
+
+
 def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
     """
     Process BenefitHistory Excel file with multiple sheets (ESPP and Restricted Stock).
@@ -1601,6 +1878,9 @@ def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
             tax_df = tax_df.sort_values("Grant Date Parsed", ascending=False)
             tax_df = tax_df.drop("Grant Date Parsed", axis=1)
             tax_df.to_excel(writer, sheet_name="Tax Withholdings", index=False)
+
+        # Create Schedule FA Table A3 sheet (handles its own formatting internally)
+        _write_schedule_fa_table_a3(writer, grants)
 
         # --- Apply formatting to all sheets ---
         if OPENPYXL_AVAILABLE:
