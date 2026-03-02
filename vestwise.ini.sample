@@ -1,0 +1,23 @@
+# vestwise.ini — User configuration for vestwise
+# All values are optional. Script falls back to hardcoded defaults if absent.
+
+[tax]
+# Indian tax rates for foreign/unlisted shares (post-Budget 2024)
+# LTCG: 12.5% for holdings >= 24 months
+ltcg_rate = 0.125
+# STCG: user's marginal slab rate
+stcg_rate = 0.30
+# Holding period threshold in months for LTCG classification
+ltcg_holding_months = 24
+
+[paths]
+# Remote URL for SBI TTBR exchange rates (Rule 115 compliance)
+sbi_ttbr_csv_url = https://raw.githubusercontent.com/sahilgupta/sbi-fx-ratekeeper/main/csv_files/SBI_REFERENCE_RATES_USD.csv
+# Local cache file for SBI rates (relative to script directory)
+sbi_ttbr_cache_file = data/SBI_REFERENCE_RATES_USD.csv
+# User-editable sale price overrides (relative to script directory)
+sale_price_overrides_file = data/sale_price_overrides.csv
+# Input file (Schwab BenefitHistory export)
+input_file = BenefitHistory.xlsx
+# Output filename template ({timestamp} is replaced at runtime)
+output_file_template = {timestamp}_rsu_summary.xlsx

@@ -1,6 +1,6 @@
 [project]
 name = "vestwise"
-version = "2026.0301.2221"
+version = "2026.0302.1321"
 description = "Turn eTrade RSU/ESPP history into ITR-ready capital gains schedules"
 authors = [{name = "Neeraj Tikku"}]
 requires-python = ">=3.11"

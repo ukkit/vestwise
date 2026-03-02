@@ -1,8 +1,9 @@
-__version__ = "2026.0301.2221"
+__version__ = "2026.0302.1321"
 __author__ = "Neeraj Tikku"
 __copyright__ = "Copyright 2026, Neeraj Tikku"
 
 import calendar
+import configparser
 import os
 import urllib.request
 import warnings
@@ -41,6 +42,35 @@ SBI_TTBR_CSV_URL = (
 )
 SBI_TTBR_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "SBI_REFERENCE_RATES_USD.csv")
 SALE_PRICE_OVERRIDES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "sale_price_overrides.csv")
+
+
+def _load_config():
+    """Load overrides from vestwise.ini (if present). Falls back to hardcoded defaults."""
+    global LTCG_RATE, STCG_RATE, LTCG_HOLDING_MONTHS
+    global SBI_TTBR_CSV_URL, SBI_TTBR_CACHE_FILE, SALE_PRICE_OVERRIDES_FILE
+
+    config = configparser.ConfigParser()
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vestwise.ini")
+    if not config.read(config_path):
+        return  # No ini file — silently use hardcoded defaults
+
+    LTCG_RATE = config.getfloat("tax", "ltcg_rate", fallback=LTCG_RATE)
+    STCG_RATE = config.getfloat("tax", "stcg_rate", fallback=STCG_RATE)
+    LTCG_HOLDING_MONTHS = config.getint("tax", "ltcg_holding_months", fallback=LTCG_HOLDING_MONTHS)
+    SBI_TTBR_CSV_URL = config.get("paths", "sbi_ttbr_csv_url", fallback=SBI_TTBR_CSV_URL)
+
+    # Resolve relative paths against script directory
+    _base = os.path.dirname(os.path.abspath(__file__))
+    raw_cache = config.get("paths", "sbi_ttbr_cache_file", fallback=None)
+    if raw_cache:
+        SBI_TTBR_CACHE_FILE = os.path.join(_base, raw_cache) if not os.path.isabs(raw_cache) else raw_cache
+
+    raw_overrides = config.get("paths", "sale_price_overrides_file", fallback=None)
+    if raw_overrides:
+        SALE_PRICE_OVERRIDES_FILE = os.path.join(_base, raw_overrides) if not os.path.isabs(raw_overrides) else raw_overrides
+
+
+_load_config()
 
 
 def parse_percentage(value_str):
@@ -2625,11 +2655,15 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price="PTC"):
 
 
 def main():
-    # File paths
-    input_file = "BenefitHistory.xlsx"  # Input file with multiple sheets (ESPP and Restricted Stock)
+    config = configparser.ConfigParser()
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vestwise.ini")
+    config.read(config_path)
+
+    input_file = config.get("paths", "input_file", fallback="BenefitHistory.xlsx")
+    out_template = config.get("paths", "output_file_template", fallback="{timestamp}_rsu_summary.xlsx")
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    # output_file = "rsu_summary.xlsx"  # Output file name
-    output_file = f"{timestamp}_rsu_summary.xlsx"
+    output_file = out_template.format(timestamp=timestamp)
 
     # Process the benefit history (RSU and ESPP)
     process_rsu_tracker(input_file, output_file)

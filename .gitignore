@@ -16,6 +16,9 @@ __pycache__/
 # Data cache and overrides (user-specific, re-generated on run)
 data/
 
+# User config (copy vestwise.ini.sample → vestwise.ini to customize)
+vestwise.ini
+
 # IDE / tooling
 .claude/*
 .vscode/

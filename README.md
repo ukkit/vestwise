@@ -1,10 +1,9 @@
-# VestWise
+# 🏛️ vestwise
 
 Turn eTrade RSU/ESPP history into ITR-ready capital gains schedules.
 
 Processes an eTrade `BenefitHistory.xlsx` export and produces a formatted Excel workbook.
 
-**Sample files:** [`sample/BenefitHistory.xlsx`](sample/BenefitHistory.xlsx) (input) ·
 > [!CAUTION]
 > **For personal reference only.** This tool is not a substitute for professional tax advice. Do not use its output for actual tax filings. Tax laws change, calculations may be incorrect, and individual circumstances vary. Always consult a qualified chartered accountant for your ITR.
 
@@ -22,9 +21,9 @@ cd vestwise
 uv run script.py
 ```
 
-No need to create a virtualenv or run `pip install` — `uv` reads `pyproject.toml` and handles everything automatically on first run.
-
 ## Usage
+
+**Sample input file** [`sample/BenefitHistory.xlsx`](sample/BenefitHistory.xlsx)
 
 Place `BenefitHistory.xlsx` (downloaded from eTrade) in the project directory, then:
 
@@ -33,6 +32,26 @@ uv run script.py
 ```
 
 Writes a timestamped output file, e.g. `20260301_120000_rsu_summary.xlsx` in project directory.
+
+## Configuration
+
+Copy `vestwise.ini.sample` → `vestwise.ini` to override defaults without editing source code:
+
+```bash
+cp vestwise.ini.sample vestwise.ini
+```
+
+`vestwise.ini` is gitignored — edit it freely. All keys are optional; the script falls back to hardcoded defaults if the file is absent or a key is missing.
+
+| Key | Section | Default | Purpose |
+|-----|---------|---------|---------|
+| `ltcg_rate` | `[tax]` | `0.125` | LTCG tax rate |
+| `stcg_rate` | `[tax]` | `0.30` | STCG tax rate (marginal slab) |
+| `ltcg_holding_months` | `[tax]` | `24` | Holding threshold for LTCG |
+| `input_file` | `[paths]` | `BenefitHistory.xlsx` | Input spreadsheet path |
+| `output_file_template` | `[paths]` | `{timestamp}_rsu_summary.xlsx` | Output filename (`{timestamp}` is substituted) |
+| `sbi_ttbr_cache_file` | `[paths]` | `data/SBI_REFERENCE_RATES_USD.csv` | Local SBI rate cache |
+| `sale_price_overrides_file` | `[paths]` | `data/sale_price_overrides.csv` | Sale price overrides |
 
 ## Output
 
@@ -75,14 +94,17 @@ The sheet has one row per CY per company ticker, and contains all the numbers yo
 
 </details>
 
-## Indian Tax Rules Applied
+<details>
+<summary><strong>Indian Tax Rules Applied</strong></summary>
 
 - **Acquisition date** = vest/release date (not grant date)
 - **Cost basis** = FMV on release date (matches Form 16 perquisite value)
 - **LTCG threshold** = 24 months (foreign/unlisted shares)
-- **LTCG rate** = 12.5% | **STCG rate** = 30% (slab)
+- **LTCG rate** = 12.5% | **STCG rate** = 30% (slab) — override via `vestwise.ini`
 - **Exchange rate** = SBI TTBR on last business day of the preceding month (Rule 115)
 - **Share quantities** = net released shares (after tax withholding), not gross vested
+
+</details>
 
 ## Data Files
 
@@ -107,3 +129,9 @@ Persists actual sale execution prices across runs. Auto-populated on first run u
 > `[WARNING]` lines for pre-2020 dates are expected — SBI TTBR data is only available from January 2020 onward.
 
 ---
+
+## ⚠️ LTCG Holding Months = 24
+
+```text
+The 24-month threshold is specific to unlisted/foreign shares under Indian tax law. Listed Indian shares use a different threshold (12 months for LTCG), but that's not handled here since this tool targets US-listed company equity.
+```
