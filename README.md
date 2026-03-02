@@ -2,10 +2,9 @@
 
 Turn eTrade RSU/ESPP history into ITR-ready capital gains schedules.
 
-Processes an eTrade `BenefitHistory.xlsx` export and produces a formatted Excel workbook.
-
 > [!CAUTION]
 > **For personal reference only.** This tool is not a substitute for professional tax advice. Do not use its output for actual tax filings. Tax laws change, calculations may be incorrect, and individual circumstances vary. Always consult a qualified chartered accountant for your ITR.
+
 
 ## Installation
 
@@ -20,6 +19,10 @@ git clone <repo-url>
 cd vestwise
 uv run script.py
 ```
+
+## Download Excel file
+
+Login to eTrade. Go to `At Work` -> `My Account`, make sure you are on `Benefit History` tab. Then click `Download` drop-down & select `Download Expanded`, this will download filed named `BenefitHistory.xlsx`.
 
 ## Usage
 

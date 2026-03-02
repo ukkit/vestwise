@@ -1,4 +1,4 @@
-__version__ = "2026.0302.1321"
+__version__ = "2026.0302.1920"
 __author__ = "Neeraj Tikku"
 __copyright__ = "Copyright 2026, Neeraj Tikku"
 
@@ -102,6 +102,7 @@ def parse_date(date_str):
         "%m/%d/%Y",  # 11/19/2025
         "%d/%m/%Y",  # 19/11/2025 (if needed)
         "%Y-%m-%d",  # 2025-11-19
+        "%d-%m-%Y",  # 19-11-2025
         "%b %d, %Y",  # Nov 19, 2025
     ]
 
@@ -126,6 +127,12 @@ def parse_date(date_str):
 
     print(f"Warning: Could not parse date: {date_str}")
     return None
+
+
+def _fmt_date(raw: str) -> str:
+    """Normalise any parseable date string to YYYY-MM-DD. Returns raw unchanged if unparseable."""
+    parsed = parse_date(raw)
+    return parsed.strftime("%Y-%m-%d") if parsed else raw
 
 
 def get_financial_year(date_obj):
@@ -245,19 +252,33 @@ def _build_tax_summary_formulas(writer, year_tax_df, col_config, sales_col_map, 
         if not tax_type_base:
             continue
 
-        # Derive fiscal year start (YYYY) from FY string like 'FY2025-2026'
-        try:
-            fy_start_year = int(str(fy)[2:6])
-        except Exception:
-            continue
+        # Use the exact sale date so each row only captures its own sale, not
+        # the aggregate of all same-grant/same-tax-type sales in the FY.
+        # Multiple sales in the same FY with the same tax type would otherwise
+        # all show the combined total, burying any individual capital losses.
+        sale_date = row.get("_sale_date")
+        if sale_date is not None:
+            sy, sm, sd = sale_date.year, sale_date.month, sale_date.day
+            date_criteria = (
+                f"'Sales History'!${sale_date_col}:${sale_date_col},DATE({sy},{sm},{sd})"
+            )
+        else:
+            # Fallback: filter by full FY range when exact date is unavailable
+            try:
+                fy_start_year = int(str(fy)[2:6])
+            except Exception:
+                continue
+            date_criteria = (
+                f"'Sales History'!${sale_date_col}:${sale_date_col},\">=\"&DATE({fy_start_year},4,1),"
+                f"'Sales History'!${sale_date_col}:${sale_date_col},\"<=\"&DATE({fy_start_year + 1},3,31)"
+            )
 
         formula = (
             f"=SUMIFS('Sales History'!${cg_tax_col}:${cg_tax_col},"
             f"'Sales History'!${grant_id_col}:${grant_id_col},\"{grant_id}\","
             f"'Sales History'!${symbol_col}:${symbol_col},\"{symbol}\","
             f"'Sales History'!${tax_type_col}:${tax_type_col},\"{tax_type_base}\","
-            f"'Sales History'!${sale_date_col}:${sale_date_col},\">=\"&DATE({fy_start_year},4,1),"
-            f"'Sales History'!${sale_date_col}:${sale_date_col},\"<=\"&DATE({fy_start_year + 1},3,31))"
+            f"{date_criteria})"
         )
 
         ws[f"{amount_col_letter}{row_idx}"] = formula
@@ -584,6 +605,11 @@ def load_sale_price_overrides():
     """
     Load sale_price_overrides.csv into a dict keyed by (grant_id, sale_date_iso, sale_seq).
     Returns {} if the file does not exist yet.
+
+    Normalisation applied on load so legacy CSV rows are found correctly:
+    - Dates are converted to YYYY-MM-DD regardless of how they were written.
+    - Numeric grant_ids with a trailing '.0' (e.g. '130446.0') are stripped to '130446'.
+    - When the same key appears more than once, the 'manual' entry takes priority.
     """
     global _sale_price_overrides
     if _sale_price_overrides is not None:
@@ -596,16 +622,37 @@ def load_sale_price_overrides():
     try:
         df = pd.read_csv(SALE_PRICE_OVERRIDES_FILE, dtype={"grant_id": str, "sale_seq": int})
         result = {}
+        needs_rewrite = False
         for _, r in df.iterrows():
-            key = (str(r["grant_id"]), str(r["sale_date"]), int(r["sale_seq"]))
-            result[key] = {
-                "sale_price_usd": float(r["sale_price_usd"]),
-                "sale_quantity": float(r["sale_quantity"]) if pd.notna(r.get("sale_quantity")) else None,
-                "source": str(r.get("source", "xlsx")),
-                "notes": str(r.get("notes", "")) if pd.notna(r.get("notes")) else "",
-            }
+            # Normalise grant_id: strip trailing '.0' for numeric IDs
+            raw_gid = str(r["grant_id"])
+            grant_id = raw_gid[:-2] if raw_gid.endswith(".0") and raw_gid[:-2].isdigit() else raw_gid
+            if grant_id != raw_gid:
+                needs_rewrite = True
+
+            # Normalise date to YYYY-MM-DD internally; detect if CSV needs updating
+            parsed = parse_date(str(r["sale_date"]))
+            sale_date_iso = parsed.strftime("%Y-%m-%d") if parsed else str(r["sale_date"])
+            expected_display = parsed.strftime("%d-%m-%Y") if parsed else str(r["sale_date"])
+            if str(r["sale_date"]).strip() != expected_display:
+                needs_rewrite = True
+
+            key = (grant_id, sale_date_iso, int(r["sale_seq"]))
+            source = str(r.get("source", "xlsx"))
+
+            # Prefer manual entries over yfinance for duplicate keys
+            if key not in result or source == "manual":
+                result[key] = {
+                    "sale_price_usd": float(r["sale_price_usd"]),
+                    "sale_quantity": float(r["sale_quantity"]) if pd.notna(r.get("sale_quantity")) else None,
+                    "source": source,
+                    "notes": str(r.get("notes", "")) if pd.notna(r.get("notes")) else "",
+                }
         _sale_price_overrides = result
         print(f"[OK] Loaded {len(result)} sale price overrides from {SALE_PRICE_OVERRIDES_FILE}")
+        if needs_rewrite:
+            print("[INFO] Normalising sale_price_overrides.csv to DD-MM-YYYY format...")
+            save_sale_price_overrides(result)
     except Exception as e:
         print(f"[WARNING] Failed to parse sale_price_overrides.csv: {e}")
         _sale_price_overrides = {}
@@ -622,10 +669,14 @@ def save_sale_price_overrides(overrides_dict):
     os.makedirs(os.path.dirname(SALE_PRICE_OVERRIDES_FILE), exist_ok=True)
     rows = []
     for (grant_id, sale_date, sale_seq), vals in overrides_dict.items():
+        # sale_date in the key is YYYY-MM-DD (internal); write DD-MM-YYYY for human editing
+        parsed = parse_date(sale_date)
+        display_date = parsed.strftime("%d-%m-%Y") if parsed else sale_date
         rows.append(
             {
                 "grant_id": grant_id,
-                "sale_date": sale_date,
+                "sale_date": display_date,
+                "_sort_date": sale_date,  # internal ISO date for correct sort
                 "sale_seq": sale_seq,
                 "sale_price_usd": round(vals["sale_price_usd"], 2),
                 "sale_quantity": vals.get("sale_quantity"),
@@ -633,7 +684,9 @@ def save_sale_price_overrides(overrides_dict):
                 "notes": vals["notes"],
             }
         )
-    rows.sort(key=lambda r: (r["sale_date"], r["grant_id"], r["sale_seq"]), reverse=True)
+    rows.sort(key=lambda r: (r["_sort_date"], r["grant_id"], r["sale_seq"]), reverse=True)
+    for r in rows:
+        del r["_sort_date"]
     df = pd.DataFrame(
         rows, columns=["grant_id", "sale_date", "sale_seq", "sale_price_usd", "sale_quantity", "source", "notes"]
     )
@@ -651,9 +704,11 @@ def resolve_sale_price(grant_id, event_date_str, row, symbol_for_price, override
     Returns (price, source_tag, should_write_to_overrides).
     should_write_to_overrides is True only when the key is absent from the file.
     """
+    raw_gid = str(grant_id)
+    grant_id = raw_gid[:-2] if raw_gid.endswith(".0") and raw_gid[:-2].isdigit() else raw_gid
     parsed = parse_date(event_date_str)
     sale_date_iso = parsed.strftime("%Y-%m-%d") if parsed else event_date_str
-    key = (str(grant_id), sale_date_iso, sale_seq)
+    key = (grant_id, sale_date_iso, sale_seq)
 
     # Priority 1: existing entry in override file
     if key in overrides:
@@ -737,16 +792,22 @@ def get_exchange_rate(date_str):
     if sbi_rate is not None:
         return sbi_rate
 
-    # Fallback to yfinance market rate
-    print(f"[WARNING] SBI TTBR not available for {date_str}, using yfinance market rate")
+    # Parse once and normalise to YYYY-MM-DD for consistent log output
+    parsed_date = parse_date(date_str)
+    if parsed_date is None:
+        return None
+    normalized = parsed_date.strftime("%Y-%m-%d")
+
+    print(f"[WARNING] SBI TTBR not available for {normalized}, using yfinance market rate")
 
     if not YFINANCE_AVAILABLE:
         return None
 
     try:
-        parsed_date = parse_date(date_str)
-        if parsed_date is None:
-            return None
+        # Clamp future dates — yfinance has no data for dates that haven't occurred yet
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        if parsed_date > today:
+            parsed_date = today
 
         ticker = yf.Ticker("USDINR=X")
         start_date = (parsed_date - pd.Timedelta(days=5)).strftime("%Y-%m-%d")
@@ -760,7 +821,7 @@ def get_exchange_rate(date_str):
             closest_date = hist.index[hist.index.get_indexer([parsed_date], method="nearest")[0]]
             return hist.loc[closest_date, "Close"]
     except Exception as e:
-        print(f"[WARNING] yfinance exchange rate lookup failed for {date_str}: {e}")
+        print(f"[WARNING] yfinance exchange rate lookup failed for {normalized}: {e}")
 
     return None
 
@@ -776,7 +837,11 @@ def get_stock_price(symbol, date_str):
         if parsed_date is None:
             return None
 
-        # Add ticker to make it valid (e.g., PTC -> PTC)
+        # Clamp future dates — yfinance has no data for dates that haven't occurred yet
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        if parsed_date > today:
+            parsed_date = today
+
         ticker = yf.Ticker(symbol)
 
         # Get historical data around the date
@@ -847,10 +912,13 @@ def process_restricted_stock(df, symbol_for_price="PTC", grant_type="RSU", overr
         if record_type == "Grant":
             grant_counter += 1
             symbol = str(row["Symbol"]).strip() if pd.notna(row.get("Symbol")) else ""
-            grant_date_str = str(row["Grant Date"]).strip() if pd.notna(row.get("Grant Date")) else ""
+            grant_date_str = _fmt_date(str(row["Grant Date"]).strip() if pd.notna(row.get("Grant Date")) else "")
 
             # Create unique grant ID - use Grant Number if available, otherwise use date + counter
             grant_number = str(row.get("Grant Number", "")).strip() if pd.notna(row.get("Grant Number")) else ""
+            # Strip trailing .0 from numeric grant IDs (Excel reads integers as floats, e.g. "130446.0")
+            if grant_number.endswith(".0") and grant_number[:-2].isdigit():
+                grant_number = grant_number[:-2]
             if grant_number:
                 grant_id = grant_number
             else:
@@ -897,7 +965,7 @@ def process_restricted_stock(df, symbol_for_price="PTC", grant_type="RSU", overr
 
         # Handle Event records (grant, vest, release, sell)
         elif record_type == "Event" and current_grant is not None:
-            event_date_str = str(row["Date"]).strip() if pd.notna(row.get("Date")) else ""
+            event_date_str = _fmt_date(str(row["Date"]).strip() if pd.notna(row.get("Date")) else "")
             event_type = str(row["Event Type"]).strip() if pd.notna(row.get("Event Type")) else ""
             qty_or_amount = float(row["Qty. or Amount"]) if pd.notna(row.get("Qty. or Amount")) else 0
 
@@ -1017,7 +1085,7 @@ def process_restricted_stock(df, symbol_for_price="PTC", grant_type="RSU", overr
 
         # Handle Vest Schedule records
         elif record_type == "Vest Schedule" and current_grant is not None:
-            vest_date_str = str(row["Vest Date"]).strip() if pd.notna(row.get("Vest Date")) else ""
+            vest_date_str = _fmt_date(str(row["Vest Date"]).strip() if pd.notna(row.get("Vest Date")) else "")
             vested_qty = float(row["Vested Qty."]) if pd.notna(row.get("Vested Qty.")) else 0
             released_qty = float(row["Released Qty"]) if pd.notna(row.get("Released Qty")) else 0
             vest_period = str(row["Vest Period"]).strip() if pd.notna(row.get("Vest Period")) else ""
@@ -1037,7 +1105,7 @@ def process_restricted_stock(df, symbol_for_price="PTC", grant_type="RSU", overr
 
         # Handle Tax Withholding records (only for RSU, not ESPP)
         elif record_type == "Tax Withholding" and current_grant is not None and grant_type == "RSU":
-            withholding_date_str = str(row["Date"]).strip() if pd.notna(row.get("Date")) else ""
+            withholding_date_str = _fmt_date(str(row["Date"]).strip() if pd.notna(row.get("Date")) else "")
             tax_rate = parse_percentage(row["Effective Tax Rate"]) if pd.notna(row.get("Effective Tax Rate")) else 0
             withholding_amount = float(row["Withholding Amount"]) if pd.notna(row.get("Withholding Amount")) else 0
             tax_description = str(row["Tax Description"]).strip() if pd.notna(row.get("Tax Description")) else ""
@@ -1109,7 +1177,7 @@ def process_espp(df, symbol_for_price="PTC", overrides=None):
         if record_type in ("Grant", "Purchase"):
             grant_counter += 1
             symbol = str(row["Symbol"]).strip() if pd.notna(row.get("Symbol")) else ""
-            purchase_date_str = str(row["Purchase Date"]).strip() if pd.notna(row.get("Purchase Date")) else ""
+            purchase_date_str = _fmt_date(str(row["Purchase Date"]).strip() if pd.notna(row.get("Purchase Date")) else "")
 
             # Create unique grant ID
             grant_id = f"ESPP_{purchase_date_str}_{grant_counter}"
@@ -1121,7 +1189,7 @@ def process_espp(df, symbol_for_price="PTC", overrides=None):
             purchase_price = float(row["Purchase Price"]) if pd.notna(row.get("Purchase Price")) else None
 
             # Get grant date (for reference)
-            grant_date_str = str(row["Grant Date"]).strip() if pd.notna(row.get("Grant Date")) else purchase_date_str
+            grant_date_str = _fmt_date(str(row["Grant Date"]).strip() if pd.notna(row.get("Grant Date")) else purchase_date_str)
             grant_date = parse_date(grant_date_str)
 
             # Get purchased quantity and tax collection shares
@@ -1166,7 +1234,7 @@ def process_espp(df, symbol_for_price="PTC", overrides=None):
 
         # Handle Event records
         elif record_type == "Event" and current_grant is not None:
-            event_date_str = str(row["Date"]).strip() if pd.notna(row.get("Date")) else ""
+            event_date_str = _fmt_date(str(row["Date"]).strip() if pd.notna(row.get("Date")) else "")
             event_type = str(row["Event Type"]).strip() if pd.notna(row.get("Event Type")) else ""
             qty = float(row["Qty"]) if pd.notna(row.get("Qty")) else 0
 
@@ -1176,8 +1244,8 @@ def process_espp(df, symbol_for_price="PTC", overrides=None):
 
             current_grant["events"].append(event_info)
 
-            # Track sales
-            if "sold" in event_type.lower():
+            # Track sales ("SELL" is the ESPP event type; RSU uses "Shares Sold")
+            if "sold" in event_type.lower() or event_type.lower() == "sell":
                 # Determine sequence number for this sale (handles same-day multi-sales)
                 _parsed_sale = parse_date(event_date_str)
                 _sale_date_iso = _parsed_sale.strftime("%Y-%m-%d") if _parsed_sale else event_date_str
@@ -1704,11 +1772,13 @@ def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
                     "Grant Type": grant.get("grant_type", "RSU"),
                     "Grant ID": grant["grant_id"],
                     "Symbol": grant["symbol"],
+                    "Sale Date": cg_tax["date_str"],
                     "Tax Type": f"Capital Gains ({cg_tax['tax_type']})",
                     "Amount ($)": cg_tax["tax_amount"],
                     "Exchange Rate (USD-INR)": exchange_rate,
                     "Amount (INR)": None,  # Will be formula
                     "_tax_type_base": cg_tax["tax_type"],  # helper for formula matching (LTCG/STCG)
+                    "_sale_date": cg_tax["date"],  # exact date for per-sale SUMIFS filter
                     "_is_capital_gains": True,
                 }
                 year_tax_data.append(tax_row)
@@ -1723,6 +1793,7 @@ def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
                 "Grant Type",
                 "Grant ID",
                 "Symbol",
+                "Sale Date",
                 "Tax Type",
                 "Amount ($)",
                 "Exchange Rate (USD-INR)",
@@ -2003,7 +2074,7 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price="PTC"):
         if record_type == "Grant":
             grant_counter += 1
             symbol = str(row["Symbol"]).strip() if pd.notna(row.get("Symbol")) else ""
-            grant_date_str = str(row["Grant Date"]).strip() if pd.notna(row.get("Grant Date")) else ""
+            grant_date_str = _fmt_date(str(row["Grant Date"]).strip() if pd.notna(row.get("Grant Date")) else "")
 
             # Create unique grant ID (date + counter for duplicates)
             grant_id = f"{grant_date_str}_{grant_counter}"
@@ -2048,7 +2119,7 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price="PTC"):
 
         # Handle Event records (grant, vest, release, sell)
         elif record_type == "Event" and current_grant is not None:
-            event_date_str = str(row["Date"]).strip() if pd.notna(row.get("Date")) else ""
+            event_date_str = _fmt_date(str(row["Date"]).strip() if pd.notna(row.get("Date")) else "")
             event_type = str(row["Event Type"]).strip() if pd.notna(row.get("Event Type")) else ""
             qty_or_amount = float(row["Qty. or Amount"]) if pd.notna(row.get("Qty. or Amount")) else 0
 
@@ -2168,7 +2239,7 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price="PTC"):
 
         # Handle Vest Schedule records
         elif record_type == "Vest Schedule" and current_grant is not None:
-            vest_date_str = str(row["Vest Date"]).strip() if pd.notna(row.get("Vest Date")) else ""
+            vest_date_str = _fmt_date(str(row["Vest Date"]).strip() if pd.notna(row.get("Vest Date")) else "")
             vested_qty = float(row["Vested Qty."]) if pd.notna(row.get("Vested Qty.")) else 0
             released_qty = float(row["Released Qty"]) if pd.notna(row.get("Released Qty")) else 0
             vest_period = str(row["Vest Period"]).strip() if pd.notna(row.get("Vest Period")) else ""
@@ -2188,7 +2259,7 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price="PTC"):
 
         # Handle Tax Withholding records
         elif record_type == "Tax Withholding" and current_grant is not None:
-            withholding_date_str = str(row["Date"]).strip() if pd.notna(row.get("Date")) else ""
+            withholding_date_str = _fmt_date(str(row["Date"]).strip() if pd.notna(row.get("Date")) else "")
             tax_rate = parse_percentage(row["Effective Tax Rate"]) if pd.notna(row.get("Effective Tax Rate")) else 0
             withholding_amount = float(row["Withholding Amount"]) if pd.notna(row.get("Withholding Amount")) else 0
             tax_description = str(row["Tax Description"]).strip() if pd.notna(row.get("Tax Description")) else ""
@@ -2381,6 +2452,7 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price="PTC"):
                         "Exchange Rate (USD-INR)": exchange_rate,
                         "Amount (INR)": None,  # Will be formula
                         "_tax_type_base": cg_tax["tax_type"],
+                        "_sale_date": cg_tax["date"],  # exact date for per-sale SUMIFS filter
                         "_is_capital_gains": True,
                     }
                     year_tax_data.append(year_tax_row)
@@ -2659,7 +2731,7 @@ def main():
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vestwise.ini")
     config.read(config_path)
 
-    input_file = config.get("paths", "input_file", fallback="BenefitHistory.xlsx")
+    input_file = config.get("paths", "input_file", fallback="ByBenefitType_expanded.xlsx")
     out_template = config.get("paths", "output_file_template", fallback="{timestamp}_rsu_summary.xlsx")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
