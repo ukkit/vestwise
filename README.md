@@ -127,6 +127,8 @@ Persists actual sale execution prices across runs. Auto-populated on first run u
 | `source` | `xlsx`, `yfinance`, or `manual` |
 | `notes` | Free-text, empty by default |
 
+**After the first run, review this file.** `BenefitHistory.xlsx` does not always include actual sale execution prices. When a price is missing from the xlsx, the script falls back to the yfinance closing price (marked `source=yfinance`), which is an estimate and may differ from what was actually executed. For accurate capital gains calculations, replace any `yfinance` entries with the actual price from your brokerage contract note or account statement.
+
 **To correct a price:** edit `sale_price_usd` directly, set `source=manual`, optionally add a note. Existing entries are never overwritten by the script — only new sales get appended.
 
 > `[WARNING]` lines for pre-2020 dates are expected — SBI TTBR data is only available from January 2020 onward.

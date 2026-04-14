@@ -1808,7 +1808,7 @@ def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
         for grant_id, grant in grants.items():
             # Calculate expected shares per future vest from grant's unvested qty
             num_future_vests = sum(1 for s in grant["vest_schedules"] if s["is_future"])
-            expected_per_vest = (grant["unvested_qty"] / num_future_vests) if num_future_vests > 0 else 0
+            expected_per_vest = int(round(grant["unvested_qty"] / num_future_vests)) if num_future_vests > 0 else 0
 
             for schedule in grant["vest_schedules"]:
                 vesting_row = {
@@ -2484,7 +2484,7 @@ def process_rsu_tracker(input_file, output_file, symbol_for_price="PTC"):
         for grant_id, grant in grants.items():
             # Calculate expected shares per future vest from grant's unvested qty
             num_future_vests = sum(1 for s in grant["vest_schedules"] if s["is_future"])
-            expected_per_vest = (grant["unvested_qty"] / num_future_vests) if num_future_vests > 0 else 0
+            expected_per_vest = int(round(grant["unvested_qty"] / num_future_vests)) if num_future_vests > 0 else 0
 
             for schedule in grant["vest_schedules"]:
                 vesting_row = {
