@@ -101,9 +101,10 @@ The sheet has one row per CY per company ticker, and contains all the numbers yo
 <summary><strong>Indian Tax Rules Applied</strong></summary>
 
 - **Acquisition date** = vest/release date (not grant date)
-- **Cost basis** = FMV on release date (matches Form 16 perquisite value)
+- **Cost basis** = FMV on release date (matches Form 16 perquisite value; Form 16 is renamed to Form 130 from FY 2026-27 under Income Tax Rules, 2026)
 - **LTCG threshold** = 24 months (foreign/unlisted shares)
-- **LTCG rate** = 12.5% | **STCG rate** = 30% (slab) — override via `vestwise.ini`
+- **LTCG rate** = 12.5% without indexation | **STCG rate** = 30% (slab) — override via `vestwise.ini`
+- **₹1.25L LTCG exemption (Sec 112A)** = does not apply — that exemption covers Indian-exchange listed shares only; US RSU/ESPP sales are unlisted/foreign (Sec 112) with no annual exemption
 - **Exchange rate** = SBI TTBR on last business day of the preceding month (Rule 115)
 - **Share quantities** = net released shares (after tax withholding), not gross vested
 

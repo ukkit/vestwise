@@ -2,8 +2,8 @@
 # All values are optional. Script falls back to hardcoded defaults if absent.
 
 [tax]
-# Indian tax rates for foreign/unlisted shares (post-Budget 2024)
-# LTCG: 12.5% for holdings >= 24 months
+# Indian tax rates for foreign/unlisted shares (Finance Act 2024, carried forward under Income Tax Act 2025)
+# LTCG: 12.5% without indexation for holdings >= 24 months
 ltcg_rate = 0.125
 # STCG: user's marginal slab rate
 stcg_rate = 0.30

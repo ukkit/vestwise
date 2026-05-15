@@ -1,4 +1,4 @@
-__version__ = "2026.0302.1920"
+__version__ = "2026.0515.1200"
 __author__ = "Neeraj Tikku"
 __copyright__ = "Copyright 2026, Neeraj Tikku"
 
@@ -31,8 +31,8 @@ try:
 except ImportError:
     OPENPYXL_AVAILABLE = False
 
-# Indian tax rates for foreign/unlisted shares (post-Budget 2024)
-LTCG_RATE = 0.125  # 12.5% for holdings >= 24 months
+# Indian tax rates for foreign/unlisted shares (Finance Act 2024, carried forward under Income Tax Act 2025)
+LTCG_RATE = 0.125  # 12.5% without indexation for holdings >= 24 months
 STCG_RATE = 0.30  # User's marginal slab rate (default 30%)
 LTCG_HOLDING_MONTHS = 24  # Unlisted/foreign shares threshold
 
@@ -1504,7 +1504,7 @@ def _write_schedule_fa_table_a3(writer, grants):
             fa_rows.append(
                 {
                     "CY": f"CY{y}",
-                    "AY": f"AY{y + 1}-{y + 2}",
+                    "AY": f"AY{y + 1}-{y + 2}" if y < 2026 else f"TY{y}-{y + 1}",
                     "Country Code": "US",
                     "Name of Entity (Ticker)": symbol,
                     "Nature of Interest": "Direct",
@@ -1557,7 +1557,7 @@ def _write_schedule_fa_table_a3(writer, grants):
     note_row = num_data_rows + 3
     notes = [
         ("NOTES — Schedule FA Table A3 (ITR-2/ITR-3) | One row per Calendar Year (Jan–Dec) per company", True),
-        ("  CY = Calendar Year (Jan 1 – Dec 31). AY = Assessment Year for ITR filing (CY+1 to CY+2).", False),
+        ("  CY = Calendar Year (Jan 1 – Dec 31). For CY2025 and earlier: AY = Assessment Year under Income Tax Act, 1961 (CY+1 to CY+2). From CY2026: Tax Year (TY) under Income Tax Act, 2025 — shown as TY{CY}-{CY+1}.", False),
         ("  'Date Since Held' uses FIFO logic — shows the vest date of the oldest UNSOLD tranche as of Dec 31.", False),
         ("  'Shares Held (Dec 31)' = closing balance to report in Schedule FA.", False),
         ("  'Peak Balance (INR)' = (shares at Jan 1 + released in CY) × peak CY intraday high × Dec 31 SBI TTBR.", False),
