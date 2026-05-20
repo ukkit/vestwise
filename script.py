@@ -1,7 +1,8 @@
-__version__ = "2026.0515.1200"
+__version__ = "2026.0520.2054"
 __author__ = "Neeraj Tikku"
 __copyright__ = "Copyright 2026, Neeraj Tikku"
 
+import argparse
 import calendar
 import configparser
 import os
@@ -1971,19 +1972,22 @@ def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Process eTrade BenefitHistory export into ITR-ready capital gains schedules.")
+    parser.add_argument("--file", required=True, metavar="FILENAME", help="Path to BenefitHistory.xlsx downloaded from eTrade")
+    args = parser.parse_args()
+
     _load_config()
 
     config = configparser.ConfigParser()
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vestwise.ini")
     config.read(config_path)
 
-    input_file = config.get("paths", "input_file", fallback="ByBenefitType_expanded.xlsx")
     out_template = config.get("paths", "output_file_template", fallback="{timestamp}_rsu_summary.xlsx")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = out_template.format(timestamp=timestamp)
 
-    process_benefit_history(input_file, output_file)
+    process_benefit_history(args.file, output_file)
 
     # Display sample of the summary
     # print("\nSample of the summary (first 5 grants):")

@@ -28,10 +28,10 @@ Login to eTrade. Go to `At Work` -> `My Account`, make sure you are on `Benefit 
 
 **Sample input file** [`sample/BenefitHistory.xlsx`](sample/BenefitHistory.xlsx)
 
-Place `BenefitHistory.xlsx` (downloaded from eTrade) in the project directory, then:
+Pass the path to `BenefitHistory.xlsx` (downloaded from eTrade) via `--file`:
 
 ```bash
-uv run script.py
+uv run script.py --file BenefitHistory.xlsx
 ```
 
 Writes a timestamped output file, e.g. `20260301_120000_rsu_summary.xlsx` in project directory.
@@ -51,7 +51,6 @@ cp vestwise.ini.sample vestwise.ini
 | `ltcg_rate` | `[tax]` | `0.125` | LTCG tax rate |
 | `stcg_rate` | `[tax]` | `0.30` | STCG tax rate (marginal slab) |
 | `ltcg_holding_months` | `[tax]` | `24` | Holding threshold for LTCG |
-| `input_file` | `[paths]` | `BenefitHistory.xlsx` | Input spreadsheet path |
 | `output_file_template` | `[paths]` | `{timestamp}_rsu_summary.xlsx` | Output filename (`{timestamp}` is substituted) |
 | `sbi_ttbr_cache_file` | `[paths]` | `data/SBI_REFERENCE_RATES_USD.csv` | Local SBI rate cache |
 | `sale_price_overrides_file` | `[paths]` | `data/sale_price_overrides.csv` | Sale price overrides |

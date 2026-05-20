@@ -803,7 +803,7 @@ wheels = [
 
 [[package]]
 name = "vestwise"
-version = "2026.302.1920"
+version = "2026.515.1200"
 source = { virtual = "." }
 dependencies = [
     { name = "numpy" },
