@@ -15,9 +15,9 @@ Requires [uv](https://docs.astral.sh/uv/getting-started/installation/).
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone and run — uv installs dependencies automatically
-git clone <repo-url>
+git clone https://github.com/ukkit/vestwise
 cd vestwise
-uv run script.py
+uv sync
 ```
 
 ## Download Excel file
