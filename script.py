@@ -70,9 +70,6 @@ def _load_config():
         SALE_PRICE_OVERRIDES_FILE = os.path.join(_base, raw_overrides) if not os.path.isabs(raw_overrides) else raw_overrides
 
 
-_load_config()
-
-
 def parse_percentage(value_str):
     """Parse percentage string (e.g., '30.9%') to float."""
     if pd.isna(value_str) or str(value_str).strip() == "":
@@ -535,7 +532,8 @@ def _format_worksheet(ws, skip_rows=None):
                 ws.cell(row=row_idx, column=col_idx).number_format = fmt
 
 
-_sbi_ttbr_df = None  # Module-level cache for SBI TTBR data
+_sbi_ttbr_df = None        # Module-level cache for SBI TTBR data
+_sbi_ttbr_load_failed = False  # True after a permanent load failure; prevents pointless retries
 
 
 def _load_sbi_ttbr_data():
@@ -543,9 +541,11 @@ def _load_sbi_ttbr_data():
     Load SBI TTBR data from cached CSV or download from GitHub.
     Returns a DataFrame indexed by date with 'TT BUY' values, or None on failure.
     """
-    global _sbi_ttbr_df
+    global _sbi_ttbr_df, _sbi_ttbr_load_failed
     if _sbi_ttbr_df is not None:
-        return _sbi_ttbr_df if not _sbi_ttbr_df.empty else None
+        return _sbi_ttbr_df
+    if _sbi_ttbr_load_failed:
+        return None
 
     cache_file = SBI_TTBR_CACHE_FILE
     need_download = True
@@ -567,7 +567,7 @@ def _load_sbi_ttbr_data():
         except Exception as e:
             print(f"[WARNING] Failed to download SBI TTBR data: {e}")
             if not os.path.exists(cache_file):
-                _sbi_ttbr_df = pd.DataFrame()  # sentinel to avoid retrying
+                _sbi_ttbr_load_failed = True
                 return None
             # Use stale cache if download fails
 
@@ -577,7 +577,7 @@ def _load_sbi_ttbr_data():
         missing = required_cols - set(df.columns.str.strip())
         if missing:
             print(f"[WARNING] SBI TTBR CSV missing expected columns: {missing}")
-            _sbi_ttbr_df = pd.DataFrame()
+            _sbi_ttbr_load_failed = True
             return None
         df.columns = df.columns.str.strip()
         df["DATE"] = pd.to_datetime(df["DATE"], format="mixed")
@@ -590,7 +590,7 @@ def _load_sbi_ttbr_data():
         return df
     except Exception as e:
         print(f"[WARNING] Failed to parse SBI TTBR CSV: {e}")
-        _sbi_ttbr_df = pd.DataFrame()  # sentinel to avoid retrying
+        _sbi_ttbr_load_failed = True
         return None
 
 
@@ -868,6 +868,91 @@ def get_stock_price(symbol, date_str):
         return None
 
 
+def _process_sale_event(
+    grant,
+    qty,
+    event_date,
+    event_date_str,
+    acquisition_date,
+    cost_basis_price,
+    row,
+    symbol_for_price,
+    overrides,
+    seq_counter,
+):
+    """
+    Resolve sale price, compute capital gains, and append to grant["sales"] and
+    grant["capital_gains_tax"]. Mutates grant and overrides in place.
+    acquisition_date and cost_basis_price are resolved by the caller (vest tranche
+    for RSU, purchase date/price for ESPP).
+    """
+    _parsed_sale = parse_date(event_date_str)
+    _sale_date_iso = _parsed_sale.strftime("%Y-%m-%d") if _parsed_sale else event_date_str
+    _seq_key = (grant["grant_id"], _sale_date_iso)
+    sale_seq = seq_counter.get(_seq_key, 0) + 1
+    seq_counter[_seq_key] = sale_seq
+
+    sale_price, price_source, _write_new = resolve_sale_price(
+        grant["grant_id"], event_date_str, row, symbol_for_price, overrides, sale_seq
+    )
+    if _write_new:
+        overrides[(grant["grant_id"], _sale_date_iso, sale_seq)] = {
+            "sale_price_usd": sale_price,
+            "sale_quantity": qty,
+            "source": price_source,
+            "notes": "",
+        }
+
+    exchange_rate = get_exchange_rate(event_date_str) if YFINANCE_AVAILABLE else None
+
+    capital_gain = 0
+    capital_gains_tax = 0
+    tax_rate = 0
+    tax_type = "N/A"
+    holding_days = (event_date - acquisition_date).days if acquisition_date and event_date else 0
+
+    if sale_price is not None and cost_basis_price is not None:
+        capital_gain = (sale_price - cost_basis_price) * qty
+        tax_rate, tax_type = get_capital_gains_tax_rate(acquisition_date, event_date)
+        if tax_rate is not None:
+            capital_gains_tax = capital_gain * tax_rate
+            grant["total_capital_gains_tax"] += capital_gains_tax
+            grant["capital_gains_tax"].append(
+                {
+                    "date": event_date,
+                    "date_str": event_date_str,
+                    "grant_price": cost_basis_price,
+                    "sale_price": sale_price,
+                    "quantity": qty,
+                    "capital_gain": capital_gain,
+                    "holding_days": holding_days,
+                    "tax_type": tax_type,
+                    "tax_rate": tax_rate,
+                    "tax_amount": capital_gains_tax,
+                }
+            )
+
+    grant["sales"].append(
+        {
+            "date": event_date,
+            "date_str": event_date_str,
+            "quantity": qty,
+            "price": sale_price,
+            "price_source": price_source,
+            "grant_price": cost_basis_price,
+            "acquisition_date": acquisition_date,
+            "capital_gain": capital_gain,
+            "capital_gains_tax": capital_gains_tax,
+            "holding_days": holding_days,
+            "tax_type": tax_type,
+            "tax_rate": tax_rate,
+            "exchange_rate": exchange_rate,
+        }
+    )
+    grant["total_sold_qty"] += qty
+    grant["sale_dates"].append(event_date_str)
+
+
 def process_restricted_stock(df, symbol_for_price="PTC", grant_type="RSU", overrides=None):
     """
     Process Restricted Stock data and return grants dictionary.
@@ -989,99 +1074,19 @@ def process_restricted_stock(df, symbol_for_price="PTC", grant_type="RSU", overr
 
             # Track sales separately
             if "sold" in event_type.lower():
-                # Determine sequence number for this sale (handles same-day multi-sales)
-                _parsed_sale = parse_date(event_date_str)
-                _sale_date_iso = _parsed_sale.strftime("%Y-%m-%d") if _parsed_sale else event_date_str
-                _seq_key = (current_grant["grant_id"], _sale_date_iso)
-                sale_seq = _sale_seq_counter.get(_seq_key, 0) + 1
-                _sale_seq_counter[_seq_key] = sale_seq
-
-                sale_price, price_source, _write_new = resolve_sale_price(
-                    current_grant["grant_id"], event_date_str, row, symbol_for_price, overrides, sale_seq
-                )
-                if _write_new:
-                    overrides[(current_grant["grant_id"], _sale_date_iso, sale_seq)] = {
-                        "sale_price_usd": sale_price,
-                        "sale_quantity": qty_or_amount,
-                        "source": price_source,
-                        "notes": "",
-                    }
-
-                # Get exchange rate on sale date
-                exchange_rate = None
-                if YFINANCE_AVAILABLE:
-                    exchange_rate = get_exchange_rate(event_date_str)
-
                 # Match sale to vest tranche (most recent vest before or on sale date)
                 matched_vest = None
                 for vt in reversed(current_grant["vest_tranches"]):
                     if vt["vest_date"] and event_date and vt["vest_date"] <= event_date:
                         matched_vest = vt
                         break
-
-                # Use vest date/price as acquisition date/cost basis for RSUs
-                if matched_vest:
-                    acquisition_date = matched_vest["vest_date"]
-                    cost_basis_price = matched_vest["vest_price"]
-                else:
-                    # Fallback to grant date if no vest tranche found
-                    acquisition_date = current_grant["grant_date"]
-                    cost_basis_price = current_grant["grant_price"]
-
-                # Calculate capital gains tax based on holding period
-                capital_gain = 0
-                capital_gains_tax = 0
-                tax_rate = 0
-                tax_type = "N/A"
-
-                if sale_price is not None and cost_basis_price is not None:
-                    capital_gain = (sale_price - cost_basis_price) * qty_or_amount
-
-                    # Determine tax rate based on holding period from vest date
-                    tax_rate, tax_type = get_capital_gains_tax_rate(acquisition_date, event_date)
-
-                    if tax_rate is not None:
-                        capital_gains_tax = capital_gain * tax_rate
-                        current_grant["total_capital_gains_tax"] += capital_gains_tax
-
-                        holding_days = (event_date - acquisition_date).days if acquisition_date else 0
-
-                        # Track capital gain tax separately
-                        current_grant["capital_gains_tax"].append(
-                            {
-                                "date": event_date,
-                                "date_str": event_date_str,
-                                "grant_price": cost_basis_price,
-                                "sale_price": sale_price,
-                                "quantity": qty_or_amount,
-                                "capital_gain": capital_gain,
-                                "holding_days": holding_days,
-                                "tax_type": tax_type,
-                                "tax_rate": tax_rate,
-                                "tax_amount": capital_gains_tax,
-                            }
-                        )
-
-                holding_days = (event_date - acquisition_date).days if acquisition_date and event_date else 0
-
-                sale_info = {
-                    "date": event_date,
-                    "date_str": event_date_str,
-                    "quantity": qty_or_amount,
-                    "price": sale_price,
-                    "price_source": price_source,
-                    "grant_price": cost_basis_price,  # FMV on vest date
-                    "acquisition_date": acquisition_date,  # Vest date for holding period
-                    "capital_gain": capital_gain,
-                    "capital_gains_tax": capital_gains_tax,
-                    "holding_days": holding_days,
-                    "tax_type": tax_type,
-                    "tax_rate": tax_rate,
-                    "exchange_rate": exchange_rate,
-                }
-                current_grant["sales"].append(sale_info)
-                current_grant["total_sold_qty"] += qty_or_amount
-                current_grant["sale_dates"].append(event_date_str)
+                acquisition_date = matched_vest["vest_date"] if matched_vest else current_grant["grant_date"]
+                cost_basis_price = matched_vest["vest_price"] if matched_vest else current_grant["grant_price"]
+                _process_sale_event(
+                    current_grant, qty_or_amount, event_date, event_date_str,
+                    acquisition_date, cost_basis_price,
+                    row, symbol_for_price, overrides, _sale_seq_counter,
+                )
 
         # Handle Vest Schedule records
         elif record_type == "Vest Schedule" and current_grant is not None:
@@ -1246,77 +1251,11 @@ def process_espp(df, symbol_for_price="PTC", overrides=None):
 
             # Track sales ("SELL" is the ESPP event type; RSU uses "Shares Sold")
             if "sold" in event_type.lower() or event_type.lower() == "sell":
-                # Determine sequence number for this sale (handles same-day multi-sales)
-                _parsed_sale = parse_date(event_date_str)
-                _sale_date_iso = _parsed_sale.strftime("%Y-%m-%d") if _parsed_sale else event_date_str
-                _seq_key = (current_grant["grant_id"], _sale_date_iso)
-                sale_seq = _sale_seq_counter.get(_seq_key, 0) + 1
-                _sale_seq_counter[_seq_key] = sale_seq
-
-                sale_price, price_source, _write_new = resolve_sale_price(
-                    current_grant["grant_id"], event_date_str, row, symbol_for_price, overrides, sale_seq
+                _process_sale_event(
+                    current_grant, qty, event_date, event_date_str,
+                    current_grant["purchase_date"], current_grant["grant_price"],
+                    row, symbol_for_price, overrides, _sale_seq_counter,
                 )
-                if _write_new:
-                    overrides[(current_grant["grant_id"], _sale_date_iso, sale_seq)] = {
-                        "sale_price_usd": sale_price,
-                        "sale_quantity": qty,
-                        "source": price_source,
-                        "notes": "",
-                    }
-
-                # Get exchange rate on sale date
-                exchange_rate = None
-                if YFINANCE_AVAILABLE:
-                    exchange_rate = get_exchange_rate(event_date_str)
-
-                # Calculate capital gains tax based on holding period
-                capital_gain = 0
-                capital_gains_tax = 0
-                tax_rate = 0
-                tax_type = "N/A"
-
-                if sale_price is not None and current_grant["grant_price"] is not None:
-                    capital_gain = (sale_price - current_grant["grant_price"]) * qty
-
-                    # Determine tax rate based on holding period
-                    tax_rate, tax_type = get_capital_gains_tax_rate(current_grant["purchase_date"], event_date)
-
-                    if tax_rate is not None:
-                        capital_gains_tax = capital_gain * tax_rate
-                        current_grant["total_capital_gains_tax"] += capital_gains_tax
-
-                        # Track capital gain tax separately
-                        current_grant["capital_gains_tax"].append(
-                            {
-                                "date": event_date,
-                                "date_str": event_date_str,
-                                "grant_price": current_grant["grant_price"],
-                                "sale_price": sale_price,
-                                "quantity": qty,
-                                "capital_gain": capital_gain,
-                                "holding_days": (event_date - current_grant["purchase_date"]).days,
-                                "tax_type": tax_type,
-                                "tax_rate": tax_rate,
-                                "tax_amount": capital_gains_tax,
-                            }
-                        )
-
-                sale_info = {
-                    "date": event_date,
-                    "date_str": event_date_str,
-                    "quantity": qty,
-                    "price": sale_price,
-                    "price_source": price_source,
-                    "grant_price": current_grant["grant_price"],
-                    "capital_gain": capital_gain,
-                    "capital_gains_tax": capital_gains_tax,
-                    "tax_type": tax_type,
-                    "tax_rate": tax_rate,
-                    "exchange_rate": exchange_rate,
-                }
-                current_grant["sales"].append(sale_info)
-                current_grant["total_sold_qty"] += qty
-                current_grant["sale_dates"].append(event_date_str)
 
     return grants
 
@@ -1856,6 +1795,13 @@ def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
         sales_data = []
         for grant_id, grant in grants.items():
             for sale in grant["sales"]:
+                holding_days = (
+                    sale.get("holding_days", (sale["date"] - grant["grant_date"]).days)
+                    if sale["date"] and grant["grant_date"]
+                    else 0
+                )
+                _hd_y, _hd_r = divmod(int(holding_days), 365)
+                holding_display = (f"{_hd_y}y {_hd_r}d" if _hd_r else f"{_hd_y}y") if _hd_y > 0 else f"{holding_days} days"
                 sales_row = {
                     "Grant Type": grant.get("grant_type", "RSU"),
                     "Grant ID": grant["grant_id"],
@@ -1867,13 +1813,14 @@ def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
                     "Sale Price Source": sale.get("price_source", ""),
                     "Grant Price ($)": sale["grant_price"],
                     "Capital Gain ($)": sale["capital_gain"],
-                    "Holding Days": sale.get("holding_days", (sale["date"] - grant["grant_date"]).days)
-                    if sale["date"] and grant["grant_date"]
-                    else 0,
+                    "Holding Days": holding_days,
+                    "Holding Period": holding_display,
                     "Tax Type": sale["tax_type"],
                     "Tax Rate (%)": sale["tax_rate"] * 100 if sale["tax_rate"] else 0,
                     "Capital Gains Tax ($)": sale["capital_gains_tax"],
+                    "Estimated Proceeds ($)": None,  # Will be calculated by formula
                     "Exchange Rate (USD-INR)": sale["exchange_rate"],
+                    "Estimated Proceeds (INR)": None,  # Will be calculated by formula
                     "Capital Gain (INR)": None,  # Will be calculated by formula
                     "Capital Gains Tax (INR)": None,  # Will be calculated by formula
                 }
@@ -1904,7 +1851,9 @@ def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
                     qty_col = get_column_letter(col_indices.get("Qty. Sold", 1))
                     tax_rate_col = get_column_letter(col_indices.get("Tax Rate (%)", 1))
                     cap_gain_tax_col = get_column_letter(col_indices.get("Capital Gains Tax ($)", 1))
+                    proceeds_col = get_column_letter(col_indices.get("Estimated Proceeds ($)", 1))
                     exchange_col = get_column_letter(col_indices.get("Exchange Rate (USD-INR)", 1))
+                    proceeds_inr_col = get_column_letter(col_indices.get("Estimated Proceeds (INR)", 1))
                     cap_gain_inr_col = get_column_letter(col_indices.get("Capital Gain (INR)", 1))
                     cap_gain_tax_inr_col = get_column_letter(col_indices.get("Capital Gains Tax (INR)", 1))
 
@@ -1918,6 +1867,16 @@ def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
                         f'=IF(AND(ISNUMBER({cap_gain_col}{row_idx}), ISNUMBER({tax_rate_col}{row_idx})), {cap_gain_col}{row_idx} * {tax_rate_col}{row_idx} / 100, "")'
                     )
 
+                    # Estimated Proceeds ($) = Quantity * Sale Price
+                    worksheet[f"{proceeds_col}{row_idx}"] = (
+                        f'=IF(AND(ISNUMBER({qty_col}{row_idx}), ISNUMBER({sale_price_col}{row_idx})), {qty_col}{row_idx} * {sale_price_col}{row_idx}, "")'
+                    )
+
+                    # Estimated Proceeds (INR) = Estimated Proceeds ($) * Exchange Rate
+                    worksheet[f"{proceeds_inr_col}{row_idx}"] = (
+                        f'=IF(AND(ISNUMBER({proceeds_col}{row_idx}), ISNUMBER({exchange_col}{row_idx}), {exchange_col}{row_idx}<>0), {proceeds_col}{row_idx} * {exchange_col}{row_idx}, "")'
+                    )
+
                     # Capital Gain (INR) = Capital Gain ($) * Exchange Rate
                     worksheet[f"{cap_gain_inr_col}{row_idx}"] = (
                         f'=IF(AND(ISNUMBER({cap_gain_col}{row_idx}), ISNUMBER({exchange_col}{row_idx}), {exchange_col}{row_idx}<>0), {cap_gain_col}{row_idx} * {exchange_col}{row_idx}, "")'
@@ -1929,9 +1888,9 @@ def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
                     )
 
                     # Apply currency formatting
-                    for col in [cap_gain_col, sale_price_col, grant_price_col, cap_gain_tax_col]:
+                    for col in [cap_gain_col, sale_price_col, grant_price_col, cap_gain_tax_col, proceeds_col]:
                         worksheet[f"{col}{row_idx}"].number_format = "$#,##0.00"
-                    for col in [cap_gain_inr_col, cap_gain_tax_inr_col]:
+                    for col in [cap_gain_inr_col, cap_gain_tax_inr_col, proceeds_inr_col]:
                         worksheet[f"{col}{row_idx}"].number_format = "#,##0.00"
                     worksheet[f"{tax_rate_col}{row_idx}"].number_format = "0.00"
 
@@ -2011,722 +1970,9 @@ def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
     return summary_df
 
 
-def process_rsu_tracker(input_file, output_file, symbol_for_price="PTC"):
-    """
-    Process RSU tracker Excel file and generate structured summary.
-    [DEPRECATED: Use process_benefit_history() for new multi-sheet format]
-
-    Parameters:
-    -----------
-    input_file : str
-        Path to input Excel file
-    output_file : str
-        Path for output Excel file
-    symbol_for_price : str
-        Stock ticker symbol for historical price lookup (default: 'PTC')
-    """
-
-    print(f"Reading file: {input_file}")
-
-    # Read the Excel file - try new format first
-    try:
-        espp_df = pd.read_excel(input_file, sheet_name="ESPP")
-    except Exception:
-        espp_df = None
-
-    try:
-        rs_df = pd.read_excel(input_file, sheet_name="Restricted Stock")
-    except Exception:
-        rs_df = None
-
-    # If new format not found, try single sheet
-    if rs_df is None and espp_df is None:
-        df = pd.read_excel(input_file)
-    else:
-        # Redirect to new function
-        return process_benefit_history(input_file, output_file, symbol_for_price)
-
-    # Standardize column names (strip whitespace)
-    df.columns = df.columns.str.strip()
-
-    # Remove completely empty rows
-    df = df.dropna(how="all")
-
-    # Reset index for easier processing
-    df = df.reset_index(drop=True)
-
-    # Dictionary to store grant information
-    grants = {}
-    current_grant = None
-    grant_counter = 0
-
-    # Load overrides for this legacy single-sheet path
-    overrides = load_sale_price_overrides()
-    _sale_seq_counter = {}  # {(grant_id, sale_date_iso): next_seq}
-
-    print("Processing data...")
-
-    # Process each row
-    for idx, row in df.iterrows():
-        record_type = str(row["Record Type"]).strip() if pd.notna(row.get("Record Type")) else ""
-
-        # Handle Grant records
-        if record_type == "Grant":
-            grant_counter += 1
-            symbol = str(row["Symbol"]).strip() if pd.notna(row.get("Symbol")) else ""
-            grant_date_str = _fmt_date(str(row["Grant Date"]).strip() if pd.notna(row.get("Grant Date")) else "")
-
-            # Create unique grant ID (date + counter for duplicates)
-            grant_id = f"{grant_date_str}_{grant_counter}"
-
-            # Parse grant date
-            grant_date = parse_date(grant_date_str)
-
-            # Get grant date stock price for capital gains calculation
-            grant_price = None
-            if YFINANCE_AVAILABLE and symbol:
-                grant_price = get_stock_price(symbol, grant_date_str)
-
-            # Initialize grant dictionary
-            current_grant = {
-                "grant_id": grant_id,
-                "symbol": symbol,
-                "grant_date": grant_date,
-                "grant_date_str": grant_date_str,
-                "grant_price": grant_price,
-                "granted_qty": float(row["Granted Qty."]) if pd.notna(row.get("Granted Qty.")) else 0,
-                "withheld_qty": float(row["Withheld Qty."]) if pd.notna(row.get("Withheld Qty.")) else 0,
-                "vested_qty": float(row["Vested Qty."]) if pd.notna(row.get("Vested Qty.")) else 0,
-                "sellable_qty": float(row["Sellable Qty."]) if pd.notna(row.get("Sellable Qty.")) else 0,
-                "unvested_qty": float(row["Unvested Qty."]) if pd.notna(row.get("Unvested Qty.")) else 0,
-                "released_qty": float(row["Released Qty"]) if pd.notna(row.get("Released Qty")) else 0,
-                "est_market_value": float(row["Est. Market Value"]) if pd.notna(row.get("Est. Market Value")) else 0,
-                "events": [],  # List of events (vest, release, sell)
-                "vest_tranches": [],  # Per-vest-tranche data for cost basis
-                "vest_schedules": [],  # List of vest schedules
-                "tax_withholdings": [],  # List of tax withholdings
-                "sales": [],  # List of sales
-                "capital_gains_tax": [],  # List of capital gains taxes
-                "total_tax_withheld": 0,
-                "total_capital_gains_tax": 0,
-                "total_sold_qty": 0,
-                "total_sale_proceeds": 0,
-                "sale_dates": [],
-                "validation_issues": [],
-            }
-
-            grants[grant_id] = current_grant
-
-        # Handle Event records (grant, vest, release, sell)
-        elif record_type == "Event" and current_grant is not None:
-            event_date_str = _fmt_date(str(row["Date"]).strip() if pd.notna(row.get("Date")) else "")
-            event_type = str(row["Event Type"]).strip() if pd.notna(row.get("Event Type")) else ""
-            qty_or_amount = float(row["Qty. or Amount"]) if pd.notna(row.get("Qty. or Amount")) else 0
-
-            event_date = parse_date(event_date_str)
-
-            event_info = {"date": event_date, "date_str": event_date_str, "type": event_type, "quantity": qty_or_amount}
-
-            current_grant["events"].append(event_info)
-
-            # Track vest tranches for RSU cost basis (vest date = acquisition date)
-            if "vested" in event_type.lower():
-                vest_price = get_stock_price(symbol_for_price, event_date_str) if YFINANCE_AVAILABLE else None
-                current_grant["vest_tranches"].append(
-                    {
-                        "vest_date": event_date,
-                        "vest_date_str": event_date_str,
-                        "quantity": qty_or_amount,
-                        "vest_price": vest_price,
-                    }
-                )
-
-            # Track sales separately
-            if "sold" in event_type.lower():
-                # Determine sequence number for this sale (handles same-day multi-sales)
-                _parsed_sale = parse_date(event_date_str)
-                _sale_date_iso = _parsed_sale.strftime("%Y-%m-%d") if _parsed_sale else event_date_str
-                _seq_key = (current_grant["grant_id"], _sale_date_iso)
-                sale_seq = _sale_seq_counter.get(_seq_key, 0) + 1
-                _sale_seq_counter[_seq_key] = sale_seq
-
-                sale_price, price_source, _write_new = resolve_sale_price(
-                    current_grant["grant_id"], event_date_str, row, symbol_for_price, overrides, sale_seq
-                )
-                if _write_new:
-                    overrides[(current_grant["grant_id"], _sale_date_iso, sale_seq)] = {
-                        "sale_price_usd": sale_price,
-                        "sale_quantity": qty_or_amount,
-                        "source": price_source,
-                        "notes": "",
-                    }
-
-                # Get exchange rate on sale date
-                exchange_rate = None
-                if YFINANCE_AVAILABLE:
-                    exchange_rate = get_exchange_rate(event_date_str)
-
-                # Match sale to vest tranche (most recent vest before or on sale date)
-                matched_vest = None
-                for vt in reversed(current_grant["vest_tranches"]):
-                    if vt["vest_date"] and event_date and vt["vest_date"] <= event_date:
-                        matched_vest = vt
-                        break
-
-                # Use vest date/price as acquisition date/cost basis for RSUs
-                if matched_vest:
-                    acquisition_date = matched_vest["vest_date"]
-                    cost_basis_price = matched_vest["vest_price"]
-                else:
-                    # Fallback to grant date if no vest tranche found
-                    acquisition_date = current_grant["grant_date"]
-                    cost_basis_price = current_grant["grant_price"]
-
-                # Calculate capital gains tax based on holding period
-                capital_gain = 0
-                capital_gains_tax = 0
-                tax_rate = 0
-                tax_type = "N/A"
-
-                if sale_price is not None and cost_basis_price is not None:
-                    capital_gain = (sale_price - cost_basis_price) * qty_or_amount
-
-                    # Determine tax rate based on holding period from vest date
-                    tax_rate, tax_type = get_capital_gains_tax_rate(acquisition_date, event_date)
-
-                    if tax_rate is not None:
-                        capital_gains_tax = capital_gain * tax_rate
-                        current_grant["total_capital_gains_tax"] += capital_gains_tax
-
-                        holding_days = (event_date - acquisition_date).days if acquisition_date else 0
-
-                        # Track capital gain tax separately
-                        current_grant["capital_gains_tax"].append(
-                            {
-                                "date": event_date,
-                                "date_str": event_date_str,
-                                "grant_price": cost_basis_price,
-                                "sale_price": sale_price,
-                                "quantity": qty_or_amount,
-                                "capital_gain": capital_gain,
-                                "holding_days": holding_days,
-                                "tax_type": tax_type,
-                                "tax_rate": tax_rate,
-                                "tax_amount": capital_gains_tax,
-                            }
-                        )
-
-                holding_days = (event_date - acquisition_date).days if acquisition_date and event_date else 0
-
-                sale_info = {
-                    "date": event_date,
-                    "date_str": event_date_str,
-                    "quantity": qty_or_amount,
-                    "price": sale_price,
-                    "price_source": price_source,
-                    "grant_price": cost_basis_price,  # FMV on vest date
-                    "acquisition_date": acquisition_date,  # Vest date for holding period
-                    "capital_gain": capital_gain,
-                    "capital_gains_tax": capital_gains_tax,
-                    "holding_days": holding_days,
-                    "tax_type": tax_type,
-                    "tax_rate": tax_rate,
-                    "exchange_rate": exchange_rate,
-                }
-                current_grant["sales"].append(sale_info)
-                current_grant["total_sold_qty"] += qty_or_amount
-                current_grant["sale_dates"].append(event_date_str)
-
-        # Handle Vest Schedule records
-        elif record_type == "Vest Schedule" and current_grant is not None:
-            vest_date_str = _fmt_date(str(row["Vest Date"]).strip() if pd.notna(row.get("Vest Date")) else "")
-            vested_qty = float(row["Vested Qty."]) if pd.notna(row.get("Vested Qty.")) else 0
-            released_qty = float(row["Released Qty"]) if pd.notna(row.get("Released Qty")) else 0
-            vest_period = str(row["Vest Period"]).strip() if pd.notna(row.get("Vest Period")) else ""
-
-            vest_date = parse_date(vest_date_str)
-
-            vest_schedule = {
-                "vest_date": vest_date,
-                "vest_date_str": vest_date_str,
-                "vested_qty": vested_qty,
-                "released_qty": released_qty,
-                "vest_period": vest_period,
-                "is_future": vest_date > datetime.now() if vest_date else False,
-            }
-
-            current_grant["vest_schedules"].append(vest_schedule)
-
-        # Handle Tax Withholding records
-        elif record_type == "Tax Withholding" and current_grant is not None:
-            withholding_date_str = _fmt_date(str(row["Date"]).strip() if pd.notna(row.get("Date")) else "")
-            tax_rate = parse_percentage(row["Effective Tax Rate"]) if pd.notna(row.get("Effective Tax Rate")) else 0
-            withholding_amount = float(row["Withholding Amount"]) if pd.notna(row.get("Withholding Amount")) else 0
-            tax_description = str(row["Tax Description"]).strip() if pd.notna(row.get("Tax Description")) else ""
-
-            # Only include non-zero tax rate withholdings
-            if tax_rate > 0:
-                withholding_date = parse_date(withholding_date_str)
-
-                # Get exchange rate on withholding date
-                exchange_rate = None
-                if YFINANCE_AVAILABLE and withholding_date_str:
-                    exchange_rate = get_exchange_rate(withholding_date_str)
-
-                tax_info = {
-                    "date": withholding_date,
-                    "date_str": withholding_date_str,
-                    "tax_rate": tax_rate,
-                    "withholding_amount": withholding_amount,
-                    "tax_description": tax_description,
-                    "exchange_rate": exchange_rate,
-                }
-
-                current_grant["tax_withholdings"].append(tax_info)
-                current_grant["total_tax_withheld"] += withholding_amount
-
-    # Persist any newly discovered sale prices for the legacy single-sheet path
-    save_sale_price_overrides(overrides)
-
-    print(f"Found {len(grants)} grants")
-
-    # Process and validate each grant
-    summary_data = []
-
-    for grant_id, grant in grants.items():
-        # Calculate derived values
-        total_released = sum(event["quantity"] for event in grant["events"] if "released" in event["type"].lower())
-
-        # Calculate future vesting from schedules
-        future_vesting_qty = sum(
-            schedule["vested_qty"] for schedule in grant["vest_schedules"] if schedule["is_future"]
-        )
-
-        # Calculate next vest date
-        future_vest_dates = [
-            schedule["vest_date"]
-            for schedule in grant["vest_schedules"]
-            if schedule["is_future"] and schedule["vest_date"]
-        ]
-        next_vest_date = min(future_vest_dates) if future_vest_dates else None
-
-        # Calculate sellable quantity
-        # RSU: Released already accounts for ~30% tax withholding at vesting
-        calculated_sellable = total_released - grant["total_sold_qty"]
-
-        # Calculate unvested quantity (alternative calculation)
-        calculated_unvested = grant["granted_qty"] - grant["vested_qty"]
-
-        # Validation checks
-        validation_issues = []
-
-        # Check 1: Granted = Vested + Unvested
-        if abs(grant["granted_qty"] - (grant["vested_qty"] + grant["unvested_qty"])) > 0.01:
-            validation_issues.append(
-                f"Granted ({grant['granted_qty']}) ≠ Vested ({grant['vested_qty']}) + Unvested ({grant['unvested_qty']})"
-            )
-
-        # Check 2: Sellable Qty matches calculation
-        if abs(grant["sellable_qty"] - calculated_sellable) > 0.01:
-            validation_issues.append(
-                f"Sellable Qty mismatch: Stored={grant['sellable_qty']}, Calculated={calculated_sellable}"
-            )
-
-        # Check 3: Unvested Qty matches calculation
-        if abs(grant["unvested_qty"] - calculated_unvested) > 0.01:
-            validation_issues.append(
-                f"Unvested Qty mismatch: Stored={grant['unvested_qty']}, Calculated={calculated_unvested}"
-            )
-
-        # Note: Removed checks 4 & 5 comparing Events vs Schedules
-        # These can legitimately differ due to:
-        # - Tax withholding reducing actual vesting
-        # - Events and Schedules coming from different data sources
-        # - Planned schedules vs actual outcomes
-
-        # Format sale dates
-        sale_dates_str = "; ".join(sorted(set(grant["sale_dates"]))) if grant["sale_dates"] else "None"
-
-        # Format next vest date
-        next_vest_str = next_vest_date.strftime("%Y-%m-%d") if next_vest_date else "N/A"
-
-        # Format validation issues
-        validation_str = " | ".join(validation_issues) if validation_issues else "OK"
-
-        # Prepare summary row
-        summary_row = {
-            "Grant Type": grant.get("grant_type", "RSU"),  # RSU or ESPP
-            "Grant ID": grant["grant_id"],
-            "Symbol": grant["symbol"],
-            "Grant Date": grant["grant_date_str"],
-            "Units": grant["granted_qty"],
-            "Vested to Date": grant["vested_qty"],
-            "Withheld for Taxes": grant["withheld_qty"],
-            "Released to Account": total_released,
-            "Tax Withheld ($)": grant["total_tax_withheld"],
-            "Sold": grant["total_sold_qty"],
-            "Sale Dates": sale_dates_str,
-            "Sellable": grant["sellable_qty"],
-            "Calc Sellable": calculated_sellable,
-            "Unvested": grant["unvested_qty"],
-            "Calc Unvested": calculated_unvested,
-            "Future Vesting (from schedules)": future_vesting_qty,
-            "Next Vest Date": next_vest_str,
-            "Estimated Market Value ($)": grant["est_market_value"],
-            "Validation Status": validation_str,
-            "# of Sales": len(grant["sales"]),
-            "# of Vest Schedules": len(grant["vest_schedules"]),
-            "# of Tax Withholdings": len(grant["tax_withholdings"]),
-        }
-
-        summary_data.append(summary_row)
-
-    # Create summary DataFrame
-    summary_df = pd.DataFrame(summary_data)
-
-    # Sort by Grant Date
-    summary_df["Grant Date Parsed"] = pd.to_datetime(summary_df["Grant Date"], errors="coerce")
-    summary_df = summary_df.sort_values("Grant Date Parsed", ascending=False)
-    summary_df = summary_df.drop("Grant Date Parsed", axis=1)
-
-    # Create additional sheets for detailed views
-    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-        # Main summary sheet
-        summary_df.to_excel(writer, sheet_name="Grant Summary", index=False)
-
-        # Create year-wise tax summary sheet
-        year_tax_data = []
-        tax_summary_subtotal_rows = set()
-        tax_summary_data_row_mapping = []
-
-        # Add withholding taxes
-        for grant_id, grant in grants.items():
-            for tax in grant["tax_withholdings"]:
-                fy = get_financial_year(tax["date"]) if tax["date"] else get_financial_year(grant["grant_date"])
-                if fy:
-                    # Use exchange rate that was fetched during data processing, default to None if not available
-                    exchange_rate = tax.get("exchange_rate", None)
-
-                    year_tax_row = {
-                        "Financial Year": fy,
-                        "Tax Date": tax["date_str"],
-                        "Grant ID": grant["grant_id"],
-                        "Symbol": grant["symbol"],
-                        "Tax Type": "Withholding Tax",
-                        "Tax Description": tax["tax_description"],
-                        "Rate (%)": tax["tax_rate"],
-                        "Amount ($)": tax["withholding_amount"],
-                        "Exchange Rate (USD-INR)": exchange_rate,
-                        "Amount (INR)": None,  # Will be formula
-                        "_tax_type_base": None,
-                        "_is_capital_gains": False,
-                    }
-                    year_tax_data.append(year_tax_row)
-
-        # Add capital gains taxes
-        for grant_id, grant in grants.items():
-            for cg_tax in grant["capital_gains_tax"]:
-                fy = get_financial_year(cg_tax["date"])
-                if fy:
-                    holding_days_display = (
-                        f"{cg_tax['holding_days']} days"
-                        if cg_tax["holding_days"] <= 365
-                        else f"{cg_tax['holding_days'] // 365} years {cg_tax['holding_days'] % 365} days"
-                    )
-                    # Get exchange rate from the sale that was already fetched
-                    exchange_rate = None
-                    for sale in grant["sales"]:
-                        if sale["date_str"] == cg_tax["date_str"]:
-                            exchange_rate = sale["exchange_rate"]
-                            break
-
-                    year_tax_row = {
-                        "Financial Year": fy,
-                        "Tax Date": cg_tax["date_str"],
-                        "Grant ID": grant["grant_id"],
-                        "Symbol": grant["symbol"],
-                        "Tax Type": f"{cg_tax['tax_type']} (Holding: {holding_days_display})",
-                        "Tax Description": f"Sale @ ${cg_tax['sale_price']:.2f} (Cost Basis: ${cg_tax['grant_price']:.2f})",
-                        "Rate (%)": cg_tax["tax_rate"] * 100,
-                        "Amount ($)": cg_tax["tax_amount"],
-                        "Exchange Rate (USD-INR)": exchange_rate,
-                        "Amount (INR)": None,  # Will be formula
-                        "_tax_type_base": cg_tax["tax_type"],
-                        "_sale_date": cg_tax["date"],  # exact date for per-sale SUMIFS filter
-                        "_is_capital_gains": True,
-                    }
-                    year_tax_data.append(year_tax_row)
-
-        if year_tax_data:
-            year_tax_df = pd.DataFrame(year_tax_data)
-            # Sort by Financial Year (descending), then by tax amount
-            year_tax_df = year_tax_df.sort_values(["Financial Year", "Amount ($)"], ascending=[False, False])
-
-            # Write with FY subtotal rows
-            display_cols = [
-                "Financial Year",
-                "Tax Date",
-                "Grant ID",
-                "Symbol",
-                "Tax Type",
-                "Tax Description",
-                "Rate (%)",
-                "Amount ($)",
-                "Exchange Rate (USD-INR)",
-                "Amount (INR)",
-            ]
-            tax_summary_data_row_mapping, tax_summary_subtotal_rows = _write_tax_summary_with_subtotals(
-                writer, year_tax_df, "Financial Year", display_cols
-            )
-
-        # Create detailed vesting schedule sheet
-        vesting_data = []
-        for grant_id, grant in grants.items():
-            # Calculate expected shares per future vest from grant's unvested qty
-            num_future_vests = sum(1 for s in grant["vest_schedules"] if s["is_future"])
-            expected_per_vest = int(round(grant["unvested_qty"] / num_future_vests)) if num_future_vests > 0 else 0
-
-            for schedule in grant["vest_schedules"]:
-                vesting_row = {
-                    "Grant ID": grant["grant_id"],
-                    "Symbol": grant["symbol"],
-                    "Grant Date": grant["grant_date_str"],
-                    "Vest Date": schedule["vest_date"],  # datetime for formulas
-                    "Vest Period": schedule["vest_period"],
-                    "Vested Quantity": schedule["vested_qty"],
-                    "Released Quantity": schedule["released_qty"],
-                    "Is Future Vesting": "Yes" if schedule["is_future"] else "No",
-                    "Days to Vesting": None,  # Formula placeholder
-                    "Future Vesting Qty": expected_per_vest if schedule["is_future"] else None,
-                }
-                vesting_data.append(vesting_row)
-
-        if vesting_data:
-            vesting_df = pd.DataFrame(vesting_data)
-            # Sort by Vest Date descending (future dates first)
-            vesting_df = vesting_df.sort_values("Vest Date", ascending=False)
-            vesting_df.to_excel(writer, sheet_name="Vesting Schedule", index=False)
-
-            if OPENPYXL_AVAILABLE:
-                ws_vest = writer.sheets["Vesting Schedule"]
-                vest_col_indices = {cell.value: cell.column for cell in ws_vest[1]}
-                vest_date_col_idx = vest_col_indices.get("Vest Date")
-                days_col_idx = vest_col_indices.get("Days to Vesting")
-
-                if vest_date_col_idx:
-                    vest_date_letter = get_column_letter(vest_date_col_idx)
-                    for row_idx in range(2, len(vesting_data) + 2):
-                        ws_vest.cell(row=row_idx, column=vest_date_col_idx).number_format = "YYYY-MM-DD"
-
-                if days_col_idx and vest_date_col_idx:
-                    days_letter = get_column_letter(days_col_idx)
-                    vest_date_letter = get_column_letter(vest_date_col_idx)
-                    for row_idx in range(2, len(vesting_data) + 2):
-                        ws_vest[f"{days_letter}{row_idx}"] = (
-                            f'=IF({vest_date_letter}{row_idx}>TODAY(), {vest_date_letter}{row_idx}-TODAY(), "")'
-                        )
-                        ws_vest[f"{days_letter}{row_idx}"].number_format = "0"
-
-        # Create sales history sheet
-        sales_data = []
-        for grant_id, grant in grants.items():
-            for sale in grant["sales"]:
-                # Use holding_days from sale (based on vest date for RSUs)
-                holding_days = sale.get(
-                    "holding_days",
-                    (sale["date"] - grant["grant_date"]).days if sale["date"] and grant["grant_date"] else 0,
-                )
-                holding_display = f"{holding_days} days"
-                if holding_days > 365:
-                    years = holding_days // 365
-                    days = holding_days % 365
-                    holding_display = f"{years}y {days}d" if days > 0 else f"{years}y"
-
-                # Store numeric values for formulas
-                tax_rate_pct = (sale["tax_rate"] * 100) if sale["tax_rate"] else None
-
-                # Exchange rate display
-                exchange_rate_display = sale["exchange_rate"] if sale["exchange_rate"] is not None else 0
-
-                sales_row = {
-                    "Grant ID": grant["grant_id"],
-                    "Symbol": grant["symbol"],
-                    "Grant Date": grant["grant_date_str"],
-                    "Sale Date": sale["date"],  # datetime for SUMIFS date comparisons
-                    "Holding Period": holding_display,
-                    "Quantity Sold": sale["quantity"],
-                    "Grant Price ($)": sale["grant_price"],
-                    "Sale Price ($)": sale["price"],
-                    "Capital Gain ($)": None,  # Will be calculated by formula
-                    "Tax Rate (%)": tax_rate_pct,
-                    "Tax Type": sale["tax_type"],
-                    "Capital Gains Tax ($)": None,  # Will be calculated by formula
-                    "Estimated Proceeds ($)": None,  # Will be calculated by formula
-                    "Exchange Rate (USD-INR)": exchange_rate_display,
-                    "Estimated Proceeds (INR)": None,  # Will be replaced with formula
-                    "Capital Gain (INR)": None,  # Will be calculated by formula
-                    "Capital Gains Tax (INR)": None,  # Will be calculated by formula
-                }
-                sales_data.append(sales_row)
-
-        if sales_data:
-            sales_df = pd.DataFrame(sales_data)
-            # Sort by Sale Date (latest first) — Sale Date is already datetime
-            sales_df = sales_df.sort_values("Sale Date", ascending=False)
-
-            sales_df.to_excel(writer, sheet_name="Sales History", index=False)
-
-            # Add formulas and formatting for calculated columns
-            if OPENPYXL_AVAILABLE:
-                worksheet = writer.sheets["Sales History"]
-
-                # Find the column indices
-                col_indices = {}
-                for col_idx, col_cell in enumerate(worksheet[1], 1):
-                    col_indices[col_cell.value] = col_idx
-
-                # Format Sale Date column as date
-                sale_date_col_idx = col_indices.get("Sale Date", None)
-                if sale_date_col_idx:
-                    for row_idx in range(2, len(sales_data) + 2):
-                        worksheet.cell(row=row_idx, column=sale_date_col_idx).number_format = "YYYY-MM-DD"
-
-                # Add formulas for calculated columns (starting from row 2)
-                for row_idx in range(2, len(sales_data) + 2):
-                    # Get column letters for reference
-                    qty_col = get_column_letter(col_indices.get("Quantity Sold", 1))
-                    grant_price_col = get_column_letter(col_indices.get("Grant Price ($)", 1))
-                    sale_price_col = get_column_letter(col_indices.get("Sale Price ($)", 1))
-                    tax_rate_col = get_column_letter(col_indices.get("Tax Rate (%)", 1))
-                    cap_gain_col = get_column_letter(col_indices.get("Capital Gain ($)", 1))
-                    cap_gain_tax_col = get_column_letter(col_indices.get("Capital Gains Tax ($)", 1))
-                    proceeds_col = get_column_letter(col_indices.get("Estimated Proceeds ($)", 1))
-                    exchange_col = get_column_letter(col_indices.get("Exchange Rate (USD-INR)", 1))
-                    proceeds_inr_col = get_column_letter(col_indices.get("Estimated Proceeds (INR)", 1))
-                    cap_gain_inr_col = get_column_letter(col_indices.get("Capital Gain (INR)", 1))
-                    cap_gain_tax_inr_col = get_column_letter(col_indices.get("Capital Gains Tax (INR)", 1))
-
-                    # Capital Gain ($) = (Sale Price - Grant Price) * Quantity
-                    worksheet[f"{cap_gain_col}{row_idx}"] = (
-                        f'=IF(AND(ISNUMBER({sale_price_col}{row_idx}), ISNUMBER({grant_price_col}{row_idx}), ISNUMBER({qty_col}{row_idx})), ({sale_price_col}{row_idx} - {grant_price_col}{row_idx}) * {qty_col}{row_idx}, "")'
-                    )
-
-                    # Capital Gains Tax ($) = Capital Gain * Tax Rate / 100
-                    worksheet[f"{cap_gain_tax_col}{row_idx}"] = (
-                        f'=IF(AND(ISNUMBER({cap_gain_col}{row_idx}), ISNUMBER({tax_rate_col}{row_idx})), {cap_gain_col}{row_idx} * {tax_rate_col}{row_idx} / 100, "")'
-                    )
-
-                    # Estimated Proceeds ($) = Quantity * Sale Price
-                    worksheet[f"{proceeds_col}{row_idx}"] = (
-                        f'=IF(AND(ISNUMBER({qty_col}{row_idx}), ISNUMBER({sale_price_col}{row_idx})), {qty_col}{row_idx} * {sale_price_col}{row_idx}, "")'
-                    )
-
-                    # Estimated Proceeds (INR) = Estimated Proceeds ($) * Exchange Rate
-                    worksheet[f"{proceeds_inr_col}{row_idx}"] = (
-                        f'=IF(AND(ISNUMBER({proceeds_col}{row_idx}), ISNUMBER({exchange_col}{row_idx}), {exchange_col}{row_idx} <> 0), {proceeds_col}{row_idx} * {exchange_col}{row_idx}, "")'
-                    )
-
-                    # Capital Gain (INR) = Capital Gain ($) * Exchange Rate
-                    worksheet[f"{cap_gain_inr_col}{row_idx}"] = (
-                        f'=IF(AND(ISNUMBER({cap_gain_col}{row_idx}), ISNUMBER({exchange_col}{row_idx}), {exchange_col}{row_idx}<>0), {cap_gain_col}{row_idx} * {exchange_col}{row_idx}, "")'
-                    )
-
-                    # Capital Gains Tax (INR) = Capital Gains Tax ($) * Exchange Rate
-                    worksheet[f"{cap_gain_tax_inr_col}{row_idx}"] = (
-                        f'=IF(AND(ISNUMBER({cap_gain_tax_col}{row_idx}), ISNUMBER({exchange_col}{row_idx}), {exchange_col}{row_idx}<>0), {cap_gain_tax_col}{row_idx} * {exchange_col}{row_idx}, "")'
-                    )
-
-                    # Apply currency formatting
-                    for col in [
-                        cap_gain_col,
-                        sale_price_col,
-                        grant_price_col,
-                        cap_gain_tax_col,
-                        proceeds_col,
-                        proceeds_inr_col,
-                    ]:
-                        worksheet[f"{col}{row_idx}"].number_format = "$#,##0.00"
-                    for col in [cap_gain_inr_col, cap_gain_tax_inr_col]:
-                        worksheet[f"{col}{row_idx}"].number_format = "#,##0.00"
-                    worksheet[f"{tax_rate_col}{row_idx}"].number_format = "0.00"
-
-        # Inject SUMIFS formulas into Year-wise Tax Summary (after Sales History is written)
-        if year_tax_data:
-            sales_col_map = _get_sales_history_col_map(writer)
-            _build_tax_summary_formulas(
-                writer,
-                year_tax_df,
-                {"fy_col": "Financial Year"},
-                sales_col_map,
-                data_row_mapping=tax_summary_data_row_mapping,
-            )
-
-            # Add Amount (INR) formulas to Year-wise Tax Summary (data rows only)
-            if OPENPYXL_AVAILABLE:
-                ws_tax = writer.sheets["Year-wise Tax Summary"]
-                ts_col_indices = {cell.value: cell.column for cell in ws_tax[1]}
-                amt_usd_idx = ts_col_indices.get("Amount ($)")
-                er_idx = ts_col_indices.get("Exchange Rate (USD-INR)")
-                amt_inr_idx = ts_col_indices.get("Amount (INR)")
-                if amt_usd_idx and er_idx and amt_inr_idx:
-                    amt_usd_letter = get_column_letter(amt_usd_idx)
-                    er_letter = get_column_letter(er_idx)
-                    amt_inr_letter = get_column_letter(amt_inr_idx)
-                    for row_idx, _ in tax_summary_data_row_mapping:
-                        ws_tax[f"{amt_inr_letter}{row_idx}"] = (
-                            f'=IF(AND(ISNUMBER({amt_usd_letter}{row_idx}), ISNUMBER({er_letter}{row_idx}), {er_letter}{row_idx}<>0), {amt_usd_letter}{row_idx} * {er_letter}{row_idx}, "")'
-                        )
-                        ws_tax[f"{amt_inr_letter}{row_idx}"].number_format = "#,##0.00"
-
-        # Create tax withholding sheet
-        tax_data = []
-        for grant_id, grant in grants.items():
-            for tax in grant["tax_withholdings"]:
-                tax_row = {
-                    "Grant ID": grant["grant_id"],
-                    "Symbol": grant["symbol"],
-                    "Grant Date": grant["grant_date_str"],
-                    "Tax Description": tax["tax_description"],
-                    "Tax Rate (%)": tax["tax_rate"],
-                    "Withholding Amount ($)": tax["withholding_amount"],
-                }
-                tax_data.append(tax_row)
-
-        if tax_data:
-            tax_df = pd.DataFrame(tax_data)
-            # Sort by Grant Date
-            tax_df["Grant Date Parsed"] = pd.to_datetime(tax_df["Grant Date"], errors="coerce")
-            tax_df = tax_df.sort_values("Grant Date Parsed", ascending=False)
-            tax_df = tax_df.drop("Grant Date Parsed", axis=1)
-            tax_df.to_excel(writer, sheet_name="Tax Withholdings", index=False)
-
-        # --- Apply formatting to all sheets ---
-        if OPENPYXL_AVAILABLE:
-            _format_worksheet(writer.sheets["Grant Summary"])
-            if year_tax_data:
-                _format_worksheet(writer.sheets["Year-wise Tax Summary"], skip_rows=tax_summary_subtotal_rows)
-            if vesting_data:
-                _format_worksheet(writer.sheets["Vesting Schedule"])
-            if sales_data:
-                _format_worksheet(writer.sheets["Sales History"])
-            if tax_data:
-                _format_worksheet(writer.sheets["Tax Withholdings"])
-
-    print(f"Summary created successfully: {output_file}")
-
-    # Check for validation issues
-    issues_df = summary_df[summary_df["Validation Status"] != "OK"]
-    if not issues_df.empty:
-        print(f"\n[WARNING]  Validation issues found in {len(issues_df)} grants:")
-        for idx, row in issues_df.iterrows():
-            print(f"  - {row['Grant ID']}: {row['Validation Status']}")
-    else:
-        print("\n[OK] All grants passed validation checks!")
-
-    return summary_df
-
-
 def main():
+    _load_config()
+
     config = configparser.ConfigParser()
     config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vestwise.ini")
     config.read(config_path)
@@ -2737,8 +1983,7 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = out_template.format(timestamp=timestamp)
 
-    # Process the benefit history (RSU and ESPP)
-    process_rsu_tracker(input_file, output_file)
+    process_benefit_history(input_file, output_file)
 
     # Display sample of the summary
     # print("\nSample of the summary (first 5 grants):")
