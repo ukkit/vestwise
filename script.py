@@ -1299,7 +1299,7 @@ def _fifo_remaining_tranches(grant):
     for event in grant.get("events", []):
         etype = event.get("type", "").lower()
         if ("released" in etype or etype == "purchase") and event.get("date") is not None:
-            vest_price = vt_price_by_date.get(event["date"].date())
+            vest_price = vt_price_by_date.get(event["date"].date())  # may be None if price was unavailable at parse time
             if vest_price is None and etype == "purchase":
                 vest_price = grant.get("grant_price")
             effective_vests.append({
