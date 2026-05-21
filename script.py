@@ -2002,9 +2002,10 @@ def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
     summary_df = pd.DataFrame(summary_data)
 
     # Sort by Grant Date
-    summary_df["Grant Date Parsed"] = pd.to_datetime(summary_df["Grant Date"], errors="coerce")
-    summary_df = summary_df.sort_values("Grant Date Parsed", ascending=False)
-    summary_df = summary_df.drop("Grant Date Parsed", axis=1)
+    if not summary_df.empty:
+        summary_df["Grant Date Parsed"] = pd.to_datetime(summary_df["Grant Date"], errors="coerce")
+        summary_df = summary_df.sort_values("Grant Date Parsed", ascending=False)
+        summary_df = summary_df.drop("Grant Date Parsed", axis=1)
 
     # Create additional sheets for detailed views
     with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
@@ -2282,13 +2283,16 @@ def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
     print(f"Summary created successfully: {output_file}")
 
     # Check for validation issues
-    issues_df = summary_df[summary_df["Validation Status"] != "OK"]
-    if not issues_df.empty:
-        print(f"\n[WARNING]  Validation issues found in {len(issues_df)} grants:")
-        for idx, row in issues_df.iterrows():
-            print(f"  - {row['Grant ID']}: {row['Validation Status']}")
+    if summary_df.empty:
+        print("\n[WARNING] No grants found — check that the input file is an eTrade BenefitHistory export.")
     else:
-        print("\n[OK] All grants passed validation checks!")
+        issues_df = summary_df[summary_df["Validation Status"] != "OK"]
+        if not issues_df.empty:
+            print(f"\n[WARNING]  Validation issues found in {len(issues_df)} grants:")
+            for idx, row in issues_df.iterrows():
+                print(f"  - {row['Grant ID']}: {row['Validation Status']}")
+        else:
+            print("\n[OK] All grants passed validation checks!")
 
     return summary_df
 

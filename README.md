@@ -70,6 +70,7 @@ cp vestwise.ini.sample vestwise.ini
 | **Year-wise Tax Summary** | FY-wise capital gains totals (STCG / LTCG) with subtotals per year |
 | **Tax Withholdings** | RSU tax-withholding events with INR exchange rates |
 | **Schedule FA (Table A3)** | ITR foreign asset disclosure — one row per calendar year per company (see below) |
+| **Sell-All Simulation** | Hypothetical P&L and tax exposure if all remaining holdings were sold at today's price — per vest tranche, with LTCG/STCG subtotals and grand total (see below) |
 
 </details>
 
@@ -93,6 +94,22 @@ The sheet has one row per CY per company ticker, and contains all the numbers yo
 | **Sale Proceeds ($) / (INR)** | Total sale proceeds in this CY |
 
 > Before filing, replace the ticker symbol in "Name of Entity" with the company's full legal name and registered address.
+
+</details>
+
+<details>
+<summary><strong>Sell-All Simulation</strong></summary>
+
+A what-if sheet: "if I sold everything today, what would my tax bill be?"
+
+- Uses today's yfinance closing price and SBI TTBR exchange rate (Rule 115)
+- Assigns remaining shares to vest tranches using **FIFO** — oldest vest date consumed by oldest historical sale first
+- Classifies each remaining tranche as **LTCG** (≥ 24 months) or **STCG** (< 24 months)
+- Shows per-tranche sale amount, capital gain, and estimated tax in both USD and INR
+- Per-symbol LTCG subtotal, STCG subtotal, combined symbol total, and a grand total row
+- Sheet is skipped if yfinance is unavailable or no unsold tranches remain
+
+> This is a simulation only — it does not constitute tax advice. Consult a qualified CA before making decisions.
 
 </details>
 
