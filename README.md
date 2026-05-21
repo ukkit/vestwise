@@ -24,18 +24,6 @@ uv sync
 
 Login to eTrade. Go to `At Work` -> `My Account`, make sure you are on `Benefit History` tab. Then click `Download` drop-down & select `Download Expanded`, this will download filed named `BenefitHistory.xlsx`.
 
-## Usage
-
-**Sample input file** [`sample/BenefitHistory.xlsx`](sample/BenefitHistory.xlsx)
-
-Pass the path to `BenefitHistory.xlsx` (downloaded from eTrade) via `--file`:
-
-```bash
-uv run script.py --file BenefitHistory.xlsx
-```
-
-Writes a timestamped output file, e.g. `20260301_120000_rsu_summary.xlsx` in project directory.
-
 ## Configuration
 
 Copy `vestwise.ini.sample` → `vestwise.ini` to override defaults without editing source code:
@@ -43,7 +31,6 @@ Copy `vestwise.ini.sample` → `vestwise.ini` to override defaults without editi
 ```bash
 cp vestwise.ini.sample vestwise.ini
 ```
-
 `vestwise.ini` is gitignored — edit it freely. All keys are optional; the script falls back to hardcoded defaults if the file is absent or a key is missing.
 
 | Key | Section | Default | Purpose |
@@ -54,6 +41,20 @@ cp vestwise.ini.sample vestwise.ini
 | `output_file_template` | `[paths]` | `{timestamp}_rsu_summary.xlsx` | Output filename (`{timestamp}` is substituted) |
 | `sbi_ttbr_cache_file` | `[paths]` | `data/SBI_REFERENCE_RATES_USD.csv` | Local SBI rate cache |
 | `sale_price_overrides_file` | `[paths]` | `data/sale_price_overrides.csv` | Sale price overrides |
+
+## Usage
+
+**Sample input file** [`sample/BenefitHistory.xlsx`](sample/BenefitHistory.xlsx)
+
+Pass the path to `BenefitHistory.xlsx` (downloaded from eTrade) via `--file`:
+
+```bash
+uv run script.py --file BenefitHistory.xlsx
+# or
+uv run script.py --file sample/BenefitHistory.xlsx
+```
+
+Writes a timestamped output file, e.g. `20260301_120000_rsu_summary.xlsx` in project directory.
 
 ## Output
 
