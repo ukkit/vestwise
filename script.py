@@ -154,7 +154,7 @@ def get_capital_gains_tax_rate(acquisition_date, sale_date):
     For foreign/unlisted shares (Indian tax rules):
     LTCG (Long-Term): 12.5% for holdings >= 24 months
     STCG (Short-Term): 30% (slab rate) for holdings < 24 months
-    Returns (rate, holding_days, tax_type)
+    Returns (rate, tax_type)
     """
     if acquisition_date is None or sale_date is None:
         return None, None
@@ -1609,7 +1609,7 @@ def _write_sell_all_simulation(writer, grants):
 
     # One yfinance call per unique symbol
     symbols = sorted({g["symbol"] for g in grants.values() if g.get("symbol")})
-    today_prices: dict = {}
+    today_prices: dict[str, float] = {}
     for sym in symbols:
         if not YFINANCE_AVAILABLE:
             break
@@ -1723,7 +1723,7 @@ def _write_sell_all_simulation(writer, grants):
                     ws.cell(row=excel_row, column=col_idx, value=val)
             excel_row += 1
 
-        symbol_end_row = excel_row - 1
+        symbol_end_row = excel_row - 1  # must be captured before subtotals — SUM range covers data rows only
 
         # LTCG subtotal row (only if LTCG tranches exist for this symbol)
         ltcg_rows = [r for r in symbol_rows if r.get("_tax_type") == "LTCG"]
