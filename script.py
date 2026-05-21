@@ -1282,6 +1282,72 @@ def _fifo_date_since_held(vests_sorted, sales_sorted, cutoff):
     return None  # all shares sold
 
 
+def _fifo_remaining_tranches(grant):
+    """
+    FIFO-walk a grant's net-released shares (from "released"/"purchase" events)
+    and consume them against existing sales to compute remaining qty per tranche.
+    Returns list of dicts: {vest_date, vest_date_str, vest_price, remaining_qty}.
+    Only tranches with remaining_qty > 0 are returned.
+    """
+    vt_price_by_date = {
+        vt["vest_date"].date(): vt["vest_price"]
+        for vt in grant.get("vest_tranches", [])
+        if vt.get("vest_date") is not None and vt.get("vest_price") is not None
+    }
+
+    effective_vests = []
+    for event in grant.get("events", []):
+        etype = event.get("type", "").lower()
+        if ("released" in etype or etype == "purchase") and event.get("date") is not None:
+            vest_price = vt_price_by_date.get(event["date"].date())
+            if vest_price is None and etype == "purchase":
+                vest_price = grant.get("grant_price")
+            effective_vests.append({
+                "vest_date": event["date"],
+                "vest_date_str": event.get("date_str", ""),
+                "vest_price": vest_price,
+                "qty": float(event.get("quantity") or 0),
+            })
+
+    # Fallback: no events but sellable shares exist (e.g. ESPP with minimal data)
+    if not effective_vests and grant.get("sellable_qty", 0) > 0:
+        acq_date = grant.get("purchase_date") or grant.get("grant_date")
+        acq_date_str = grant.get("purchase_date_str") or grant.get("grant_date_str", "")
+        effective_vests.append({
+            "vest_date": acq_date,
+            "vest_date_str": acq_date_str,
+            "vest_price": grant.get("grant_price"),
+            "qty": float(grant["sellable_qty"]),
+        })
+
+    effective_vests.sort(key=lambda v: v["vest_date"] or datetime.min)
+
+    remaining = [v["qty"] for v in effective_vests]
+    sales_sorted = sorted(
+        (s for s in grant.get("sales", []) if s.get("date") is not None),
+        key=lambda s: s["date"],
+    )
+    for sale in sales_sorted:
+        sold = float(sale.get("quantity") or 0)
+        for i in range(len(effective_vests)):
+            if sold <= 0:
+                break
+            consumed = min(remaining[i], sold)
+            remaining[i] -= consumed
+            sold -= consumed
+
+    return [
+        {
+            "vest_date": effective_vests[i]["vest_date"],
+            "vest_date_str": effective_vests[i]["vest_date_str"],
+            "vest_price": effective_vests[i]["vest_price"],
+            "remaining_qty": remaining[i],
+        }
+        for i in range(len(effective_vests))
+        if remaining[i] > 0.001
+    ]
+
+
 def _write_schedule_fa_table_a3(writer, grants):
     """
     Generate Schedule FA Table A3 sheet for ITR filing.
