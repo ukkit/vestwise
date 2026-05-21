@@ -10,6 +10,7 @@ import urllib.request
 import warnings
 from datetime import date as date_cls
 from datetime import datetime
+from itertools import groupby
 
 import pandas as pd
 
@@ -410,6 +411,8 @@ _CENTER_ALIGN_HEADERS = {
     "Vested in CY",
     "Sold in CY",
     "Shares Held (Dec 31)",
+    "Vest Date",
+    "Remaining Qty",
 }
 
 # Styles (defined once, reused across all sheets)
@@ -1595,6 +1598,256 @@ def _write_schedule_fa_table_a3(writer, grants):
     ws.row_dimensions[note_row].height = 20
 
 
+def _write_sell_all_simulation(writer, grants):
+    """
+    Generate Sell-All Simulation sheet: per-vest-tranche P&L and tax exposure
+    if all remaining holdings were sold at today's price.
+    """
+    today = datetime.now()
+    today_str = today.strftime("%Y-%m-%d")
+    today_display = today.strftime("%Y-%m-%d %H:%M")
+
+    # One yfinance call per unique symbol
+    symbols = sorted({g["symbol"] for g in grants.values() if g.get("symbol")})
+    today_prices: dict = {}
+    for sym in symbols:
+        if not YFINANCE_AVAILABLE:
+            break
+        price = get_stock_price(sym, today_str)
+        if price is not None:
+            today_prices[sym] = float(price)
+        else:
+            print(f"[WARNING] Sell-All Simulation: could not fetch today's price for {sym} — rows skipped")
+
+    today_rate = get_exchange_rate(today_str)
+
+    display_cols = [
+        "Grant Type", "Grant ID", "Symbol", "Vest Date", "Vest Price ($)",
+        "Remaining Qty", "Holding Period", "Tax Type", "Today's Price ($)",
+        "Sale Amount ($)", "Capital Gain ($)", "Tax Rate (%)",
+        "Capital Gains Tax ($)", "Exchange Rate (USD-INR)",
+        "Sale Amount (INR)", "Capital Gain (INR)", "Capital Gains Tax (INR)",
+    ]
+
+    # Build per-tranche rows
+    rows = []
+    for _grant_id, grant in grants.items():
+        symbol = grant.get("symbol", "")
+        if symbol not in today_prices:
+            continue
+        today_price = today_prices[symbol]
+        tranches = _fifo_remaining_tranches(grant)
+        if not tranches:
+            continue
+
+        for t in tranches:
+            vest_date = t["vest_date"]
+            vest_price = t["vest_price"]
+            remaining_qty = t["remaining_qty"]
+
+            holding_days = (today - vest_date).days if vest_date else 0
+            hd_y, hd_r = divmod(int(holding_days), 365)
+            holding_display = (f"{hd_y}y {hd_r}d" if hd_r else f"{hd_y}y") if hd_y > 0 else f"{holding_days} days"
+
+            tax_rate_val, tax_type = (
+                get_capital_gains_tax_rate(vest_date, today) if vest_date else (None, "N/A")
+            )
+
+            sale_amount = today_price * remaining_qty
+            cost_basis = (vest_price * remaining_qty) if vest_price is not None else None
+            capital_gain = (sale_amount - cost_basis) if cost_basis is not None else None
+            cg_tax = (capital_gain * tax_rate_val) if capital_gain is not None and tax_rate_val is not None else None
+
+            sale_amount_inr = (sale_amount * today_rate) if today_rate else None
+            capital_gain_inr = (capital_gain * today_rate) if capital_gain is not None and today_rate else None
+            cg_tax_inr = (cg_tax * today_rate) if cg_tax is not None and today_rate else None
+
+            rows.append({
+                "Grant Type": grant.get("grant_type", "RSU"),
+                "Grant ID": grant["grant_id"],
+                "Symbol": symbol,
+                "Vest Date": vest_date,
+                "Vest Price ($)": vest_price,
+                "Remaining Qty": remaining_qty,
+                "Holding Period": holding_display,
+                "Tax Type": tax_type,
+                "Today's Price ($)": today_price,
+                "Sale Amount ($)": sale_amount,
+                "Capital Gain ($)": capital_gain,
+                "Tax Rate (%)": tax_rate_val * 100 if tax_rate_val is not None else None,
+                "Capital Gains Tax ($)": cg_tax,
+                "Exchange Rate (USD-INR)": today_rate,
+                "Sale Amount (INR)": sale_amount_inr,
+                "Capital Gain (INR)": capital_gain_inr,
+                "Capital Gains Tax (INR)": cg_tax_inr,
+                "_symbol": symbol,
+                "_tax_type": tax_type,
+            })
+
+    if not rows:
+        return
+
+    # Sort by symbol then vest date (groupby requires sorted input)
+    rows.sort(key=lambda r: (r["_symbol"], r["Vest Date"] or datetime.min))
+
+    wb = writer.book
+    ws = wb.create_sheet("Sell-All Simulation")
+    writer.sheets["Sell-All Simulation"] = ws
+
+    # Header row
+    for col_idx, col_name in enumerate(display_cols, 1):
+        ws.cell(row=1, column=col_idx, value=col_name)
+
+    col_lookup = {name: idx for idx, name in enumerate(display_cols, 1)}
+
+    sum_cols = [
+        "Sale Amount ($)", "Capital Gain ($)", "Capital Gains Tax ($)",
+        "Sale Amount (INR)", "Capital Gain (INR)", "Capital Gains Tax (INR)",
+    ]
+
+    excel_row = 2
+    subtotal_rows: set[int] = set()
+    grand_totals = {c: 0.0 for c in sum_cols}
+
+    for symbol_key, symbol_group_iter in groupby(rows, key=lambda r: r["_symbol"]):
+        symbol_rows = list(symbol_group_iter)
+        symbol_start_row = excel_row
+
+        # Write data rows
+        for row in symbol_rows:
+            for col_name, col_idx in col_lookup.items():
+                if col_name.startswith("_"):
+                    continue
+                val = row.get(col_name)
+                if val is not None:
+                    ws.cell(row=excel_row, column=col_idx, value=val)
+            excel_row += 1
+
+        symbol_end_row = excel_row - 1
+
+        # LTCG subtotal row (only if LTCG tranches exist for this symbol)
+        ltcg_rows = [r for r in symbol_rows if r.get("_tax_type") == "LTCG"]
+        if ltcg_rows:
+            subtotal_rows.add(excel_row)
+            ws.cell(row=excel_row, column=col_lookup["Symbol"], value=f"{symbol_key} — LTCG")
+            ws.cell(row=excel_row, column=col_lookup["Tax Type"], value="LTCG")
+            for col_name in sum_cols:
+                total = sum(r[col_name] for r in ltcg_rows if r.get(col_name) is not None)
+                ws.cell(row=excel_row, column=col_lookup[col_name], value=total)
+            excel_row += 1
+
+        # STCG subtotal row (only if STCG tranches exist for this symbol)
+        stcg_rows = [r for r in symbol_rows if r.get("_tax_type") == "STCG"]
+        if stcg_rows:
+            subtotal_rows.add(excel_row)
+            ws.cell(row=excel_row, column=col_lookup["Symbol"], value=f"{symbol_key} — STCG")
+            ws.cell(row=excel_row, column=col_lookup["Tax Type"], value="STCG")
+            for col_name in sum_cols:
+                total = sum(r[col_name] for r in stcg_rows if r.get(col_name) is not None)
+                ws.cell(row=excel_row, column=col_lookup[col_name], value=total)
+            excel_row += 1
+
+        # Combined symbol total (SUM formula over data rows only)
+        subtotal_rows.add(excel_row)
+        ws.cell(row=excel_row, column=col_lookup["Symbol"], value=f"{symbol_key} — Total")
+        for col_name in sum_cols:
+            col_letter = get_column_letter(col_lookup[col_name])
+            ws.cell(
+                row=excel_row, column=col_lookup[col_name],
+                value=f"=SUM({col_letter}{symbol_start_row}:{col_letter}{symbol_end_row})",
+            )
+            grand_totals[col_name] += sum(r[col_name] for r in symbol_rows if r.get(col_name) is not None)
+        excel_row += 1
+
+    # Grand total row
+    subtotal_rows.add(excel_row)
+    ws.cell(row=excel_row, column=col_lookup["Symbol"], value="GRAND TOTAL")
+    for col_name in sum_cols:
+        ws.cell(row=excel_row, column=col_lookup[col_name], value=grand_totals[col_name])
+    grand_total_row = excel_row
+    excel_row += 1
+
+    # Apply base formatting (skips subtotal rows so they don't get alt-row fill)
+    if OPENPYXL_AVAILABLE:
+        _format_worksheet(ws, skip_rows=subtotal_rows)
+
+        # Style all subtotal rows (yellow fill + bold)
+        max_col = ws.max_column
+        for sr in subtotal_rows:
+            for col_idx in range(1, max_col + 1):
+                cell = ws.cell(row=sr, column=col_idx)
+                cell.font = _SUBTOTAL_FONT
+                cell.fill = _SUBTOTAL_FILL
+                cell.border = _THIN_BORDER
+
+        # Grand total gets slightly heavier emphasis
+        for col_idx in range(1, max_col + 1):
+            ws.cell(row=grand_total_row, column=col_idx).font = Font(name="Calibri", size=10, bold=True)
+
+        # Vest Date: date format on data rows
+        vest_date_col_idx = col_lookup.get("Vest Date")
+        if vest_date_col_idx:
+            for row_idx in range(2, excel_row):
+                if row_idx not in subtotal_rows:
+                    ws.cell(row=row_idx, column=vest_date_col_idx).number_format = "YYYY-MM-DD"
+
+        # Explicit number formats for columns _format_worksheet doesn't cover
+        for col_name, fmt in [
+            ("Remaining Qty", "#,##0"),
+            ("Tax Rate (%)", "0.00"),
+            ("Exchange Rate (USD-INR)", "0.0000"),
+        ]:
+            col_idx = col_lookup.get(col_name)
+            if col_idx:
+                for row_idx in range(2, excel_row):
+                    if row_idx not in subtotal_rows:
+                        ws.cell(row=row_idx, column=col_idx).number_format = fmt
+
+        # Currency formats for subtotal rows (data rows handled by _format_worksheet via column name suffix)
+        usd_cols = ["Sale Amount ($)", "Capital Gain ($)", "Capital Gains Tax ($)", "Vest Price ($)", "Today's Price ($)"]
+        inr_cols = ["Sale Amount (INR)", "Capital Gain (INR)", "Capital Gains Tax (INR)"]
+        for col_name in usd_cols:
+            col_idx = col_lookup.get(col_name)
+            if col_idx:
+                for sr in subtotal_rows:
+                    ws.cell(row=sr, column=col_idx).number_format = "$#,##0.00"
+        for col_name in inr_cols:
+            col_idx = col_lookup.get(col_name)
+            if col_idx:
+                for sr in subtotal_rows:
+                    ws.cell(row=sr, column=col_idx).number_format = "#,##0.00"
+
+    # Notes section
+    note_row = excel_row + 1
+    rate_source = "SBI TTBR" if get_sbi_ttbr(today_str) is not None else "yfinance (SBI TTBR unavailable)"
+    rate_display = f"{today_rate:.4f}" if today_rate else "N/A"
+    notes = [
+        (f"NOTES — Sell-All Simulation | Generated: {today_display}", True),
+        ("  Simulation assumes all remaining (unsold) shares are sold at today's price (latest available yfinance close).", False),
+        (f"  Exchange rate used: {rate_display} USD-INR ({rate_source}, Rule 115 — last business day of preceding month).", False),
+        ("  Shares assigned to tranches using FIFO — oldest vest date consumed by oldest sale first.", False),
+        (f"  LTCG threshold: {LTCG_HOLDING_MONTHS} months (foreign/unlisted shares). LTCG rate: {LTCG_RATE * 100:.1f}%. STCG rate: {STCG_RATE * 100:.1f}%.", False),
+        ("  This is a simulation only and does not constitute tax advice. Consult a qualified CA before making tax decisions.", False),
+    ]
+
+    bold_font = Font(name="Calibri", size=9, bold=True, color="2F5496")
+    note_font = Font(name="Calibri", size=9, italic=True, color="595959")
+    max_col = ws.max_column
+
+    for i, (note_text, is_heading) in enumerate(notes):
+        cell = ws.cell(row=note_row + i, column=1)
+        cell.value = note_text
+        cell.font = bold_font if is_heading else note_font
+        cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        if max_col > 1:
+            ws.merge_cells(
+                start_row=note_row + i, start_column=1,
+                end_row=note_row + i, end_column=max_col,
+            )
+        ws.row_dimensions[note_row + i].height = 18
+    ws.row_dimensions[note_row].height = 20
+
+
 def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
     """
     Process BenefitHistory Excel file with multiple sheets (ESPP and Restricted Stock).
@@ -2010,6 +2263,9 @@ def process_benefit_history(input_file, output_file, symbol_for_price="PTC"):
 
         # Create Schedule FA Table A3 sheet (handles its own formatting internally)
         _write_schedule_fa_table_a3(writer, grants)
+
+        # Create Sell-All Simulation sheet (handles its own formatting internally)
+        _write_sell_all_simulation(writer, grants)
 
         # --- Apply formatting to all sheets ---
         if OPENPYXL_AVAILABLE:
